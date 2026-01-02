@@ -52,8 +52,6 @@ endif ()
 
 if (NOT GIT_DEP_gx_FOUND)
     GetGitDependency(git@github.com:giarld/gx.git gx master)
-
-    set(GX_HIDE_EXAMPLES TRUE)
     add_subdirectory(deps/gx)
 endif ()
 
