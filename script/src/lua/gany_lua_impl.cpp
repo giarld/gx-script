@@ -424,7 +424,6 @@ void GAnyLuaImpl::setEnvironment(lua_State *L, const GAny &env, int funcIdx)
 
         const auto &envObj = *env.as<GAnyObject>();
 
-        std::lock_guard locker(envObj.lock);
         for (auto it = envObj.var.begin(); it != envObj.var.end(); ++it) {
             lua_pushstring(L, it->first.c_str());
             pushGAny(L, it->second);
