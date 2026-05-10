@@ -239,7 +239,7 @@ GAny GAnyJSImplQjs::eval(const std::string &script, const std::string &sourcePat
     const JSValue global = JS_GetGlobalObject(ctx);
 
     JSValue argv[] = {
-        GAnyToQJS::makeGAnyToJsValue(jsState, envObj, false)
+        GAnyToQJS::makeGAnyToJsValue(jsState, envObj, true)
     };
     const JSValue r = JS_Call(ctx, funcObj, global, 1, argv);
 
