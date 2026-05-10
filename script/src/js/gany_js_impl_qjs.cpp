@@ -9,6 +9,188 @@
 #include "gx/gfile.h"
 #include "gx/debug.h"
 
+#include <cctype>
+#include <set>
+#include <string>
+#include <vector>
+
+
+namespace
+{
+constexpr const char *GAnyModulePrefix = "gany:";
+
+struct GAnyModuleExports
+{
+    bool valid = false;
+    GAny defaultValue;
+    std::vector<std::pair<std::string, GAny>> namedExports;
+};
+
+static bool isGAnyModuleName(const char *moduleName)
+{
+    return moduleName && std::string(moduleName).rfind(GAnyModulePrefix, 0) == 0;
+}
+
+static bool hasJsModuleSyntax(const std::string &script)
+{
+    bool atLineStart = true;
+
+    for (size_t i = 0; i < script.size();) {
+        const char c = script[i];
+
+        if (c == '\n' || c == '\r') {
+            atLineStart = true;
+            ++i;
+            continue;
+        }
+        if (atLineStart && (c == ' ' || c == '\t')) {
+            ++i;
+            continue;
+        }
+        if (c == '/' && i + 1 < script.size() && script[i + 1] == '/') {
+            i += 2;
+            while (i < script.size() && script[i] != '\n' && script[i] != '\r') {
+                ++i;
+            }
+            continue;
+        }
+        if (c == '/' && i + 1 < script.size() && script[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < script.size() && !(script[i] == '*' && script[i + 1] == '/')) {
+                if (script[i] == '\n' || script[i] == '\r') {
+                    atLineStart = true;
+                }
+                ++i;
+            }
+            if (i + 1 < script.size()) {
+                i += 2;
+            }
+            continue;
+        }
+
+        if (atLineStart && (script.compare(i, 6, "import") == 0 || script.compare(i, 6, "export") == 0)) {
+            const size_t nextIndex = i + 6;
+            const bool isIdentifierTail = nextIndex < script.size()
+                                          && (std::isalnum(static_cast<unsigned char>(script[nextIndex])) || script[nextIndex] == '_' || script[nextIndex] == '$');
+            if (!isIdentifierTail) {
+                size_t tokenIndex = nextIndex;
+                while (tokenIndex < script.size() && (script[tokenIndex] == ' ' || script[tokenIndex] == '\t')) {
+                    ++tokenIndex;
+                }
+                if (script.compare(i, 6, "export") == 0 || tokenIndex == script.size() || script[tokenIndex] != '(') {
+                    return true;
+                }
+            }
+        }
+
+        atLineStart = false;
+        if (c == '\'' || c == '"' || c == '`') {
+            const char quote = c;
+            ++i;
+            while (i < script.size()) {
+                if (script[i] == '\\') {
+                    i += 2;
+                    continue;
+                }
+                if (script[i] == quote) {
+                    ++i;
+                    break;
+                }
+                ++i;
+            }
+            continue;
+        }
+        ++i;
+    }
+
+    return false;
+}
+
+static bool shouldEvalAsJsModule(const std::string &script, const std::string &sourcePath)
+{
+    const GString path = sourcePath;
+    return path.toLower().endWith(".mjs") || hasJsModuleSyntax(script);
+}
+
+static GAnyModuleExports getGAnyModuleExports(const std::string &moduleName)
+{
+    GAnyModuleExports exports;
+
+    if (moduleName.rfind(GAnyModulePrefix, 0) != 0) {
+        return exports;
+    }
+
+    const std::string importPath = moduleName.substr(std::string(GAnyModulePrefix).size());
+    if (importPath.empty()) {
+        return exports;
+    }
+
+    const bool isWildcardPath = importPath.size() >= 2 && importPath.substr(importPath.size() - 2) == ".*";
+
+    GAny imported = GAny::Import(importPath);
+    if (imported.isNull() && !isWildcardPath) {
+        imported = GAny::Import(importPath + ".*");
+    }
+
+    if (imported.isNull()) {
+        return exports;
+    }
+
+    exports.valid = true;
+    exports.defaultValue = imported;
+
+    std::set<std::string> exportedNames;
+    if (imported.isObject()) {
+        auto it = imported.iterator();
+        while (it.hasNext()) {
+            auto item = it.next();
+            const std::string name = item.first.castAs<std::string>();
+            if (!name.empty() && exportedNames.insert(name).second) {
+                exports.namedExports.emplace_back(name, item.second);
+            }
+        }
+    } else if (imported.isClass()) {
+        const auto *clazz = imported.as<GAnyClass>();
+        if (clazz && !clazz->getName().empty() && exportedNames.insert(clazz->getName()).second) {
+            exports.namedExports.emplace_back(clazz->getName(), imported);
+        }
+    }
+
+    return exports;
+}
+
+static std::string getModuleName(JSContext *ctx, JSModuleDef *m)
+{
+    const JSAtom atom = JS_GetModuleName(ctx, m);
+    const JSValue value = JS_AtomToValue(ctx, atom);
+    const char *str = JS_ToCString(ctx, value);
+    std::string moduleName = str ? str : "";
+
+    JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, value);
+    JS_FreeAtom(ctx, atom);
+
+    return moduleName;
+}
+
+static int JS_ganyModuleInit(JSContext *ctx, JSModuleDef *m)
+{
+    const JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
+    const GAnyModuleExports exports = getGAnyModuleExports(getModuleName(ctx, m));
+    if (!exports.valid) {
+        JS_ThrowReferenceError(ctx, "Could not load GAny module");
+        return -1;
+    }
+
+    JS_SetModuleExport(ctx, m, "default", GAnyToQJS::makeGAnyToJsValue(jsState, exports.defaultValue, exports.defaultValue.isObject()));
+    for (const auto &item: exports.namedExports) {
+        JS_SetModuleExport(ctx, m, item.first.c_str(), GAnyToQJS::makeGAnyToJsValue(jsState, item.second, item.second.isObject()));
+    }
+
+    return 0;
+}
+}
+
 
 static void jsStateObjectFinalizer(JSRuntime *, JSValue val)
 {
@@ -220,6 +402,55 @@ GAny GAnyJSImplQjs::eval(const std::string &script, const std::string &sourcePat
     JSContext *ctx = mJSContext;
     const JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
 
+    if (shouldEvalAsJsModule(script, sourcePath)) {
+        GAny envObj;
+        if (env.isObject()) {
+            envObj = env;
+        } else {
+            envObj = GAny::object();
+        }
+
+        const JSValue global = JS_GetGlobalObject(ctx);
+        const JSAtom envAtom = JS_NewAtom(ctx, "Env");
+        const int hasOldEnv = JS_HasProperty(ctx, global, envAtom);
+        JSValue oldEnv = JS_UNDEFINED;
+        if (hasOldEnv > 0) {
+            oldEnv = JS_GetProperty(ctx, global, envAtom);
+        }
+
+        JS_SetProperty(ctx, global, envAtom, GAnyToQJS::makeGAnyToJsValue(jsState, envObj, true));
+
+        JSValue funcObj = JS_Eval(ctx, script.c_str(), script.size(),
+                                  sourcePath.empty() ? "<input>" : sourcePath.c_str(),
+                                  JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (!JS_IsException(funcObj) && js_module_set_import_meta(ctx, funcObj, false, false) < 0) {
+            JS_FreeValue(ctx, funcObj);
+            funcObj = JS_EXCEPTION;
+        }
+
+        JSValue r = JS_EXCEPTION;
+        if (!JS_IsException(funcObj)) {
+            r = JS_EvalFunction(ctx, funcObj);
+            r = js_std_await(ctx, r);
+        }
+
+        GAny result = GAnyToQJS::makeJsValueToGAny(jsState, JS_IsException(funcObj) ? funcObj : r);
+
+        JS_FreeValue(ctx, r);
+        if (hasOldEnv > 0) {
+            JS_SetProperty(ctx, global, envAtom, oldEnv);
+        } else {
+            JS_FreeValue(ctx, oldEnv);
+            JS_DeleteProperty(ctx, global, envAtom, 0);
+        }
+        JS_FreeAtom(ctx, envAtom);
+        JS_FreeValue(ctx, global);
+
+        js_std_loop(ctx);
+
+        return result;
+    }
+
     const JSValue funcObj = JS_Eval(ctx, script.c_str(), script.size(),
                         sourcePath.empty() ? "<input>" : sourcePath.c_str(),
                         JS_EVAL_TYPE_GLOBAL);
@@ -319,7 +550,8 @@ GAny GAnyJSImplQjs::evalFile(const std::string &filePath, const GAny &env)
         return GAnyException("Failed to read file");
     }
 
-    if (GString(file.fileSuffix()).toLower() == "js") {
+    const GString suffix = GString(file.fileSuffix()).toLower();
+    if (suffix == "js" || suffix == "mjs") {
         const std::string content(reinterpret_cast<const char *>(bytes.data()), bytes.size());
         return eval(content, file.absoluteFilePath(), env);
     }
@@ -369,6 +601,30 @@ const JS_State * GAnyJSImplQjs::getJSState() const
 
 JSModuleDef *GAnyJSImplQjs::JS_moduleLoader(JSContext *ctx, const char *moduleName, void *)
 {
+    if (isGAnyModuleName(moduleName)) {
+        const GAnyModuleExports exports = getGAnyModuleExports(moduleName);
+        if (!exports.valid) {
+            JS_ThrowReferenceError(ctx, "Could not load GAny module '%s'", moduleName);
+            return nullptr;
+        }
+
+        JSModuleDef *m = JS_NewCModule(ctx, moduleName, JS_ganyModuleInit);
+        if (!m) {
+            return nullptr;
+        }
+
+        if (JS_AddModuleExport(ctx, m, "default") < 0) {
+            return nullptr;
+        }
+        for (const auto &item: exports.namedExports) {
+            if (JS_AddModuleExport(ctx, m, item.first.c_str()) < 0) {
+                return nullptr;
+            }
+        }
+
+        return m;
+    }
+
     const GByteArray buf = sFileReader(moduleName);
     if (buf.isEmpty()) {
         JS_ThrowReferenceError(ctx, "Could not load module filename '%s'", moduleName);
