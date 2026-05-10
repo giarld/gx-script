@@ -382,7 +382,7 @@ JSModuleDef *GAnyJSImplQjs::JS_moduleLoader(JSContext *ctx, const char *moduleNa
     if (JS_IsException(funcVal))
         return nullptr;
 
-    if (js_module_set_import_meta(ctx, funcVal, true, false) < 0) {
+    if (js_module_set_import_meta(ctx, funcVal, false, false) < 0) {
         JS_FreeValue(ctx, funcVal);
         return nullptr;
     }
