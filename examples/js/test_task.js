@@ -1,7 +1,7 @@
 (function (Env) {
     console.log("====== Task Begin ======");
-    let v1 = Env._getItem("v1");
-    let v2 = Env._getItem("v2");
+    let v1 = Env.v1;
+    let v2 = Env.v2;
 
     console.log("  Input v1:", v1);
     console.log("  Input v2:", v2);

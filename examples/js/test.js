@@ -37,6 +37,11 @@
         o.c = 123;
         o.pt();
 
+        let dyn = GAny.create({});
+        dyn.name = "gany";
+        dyn["version"] = 1;
+        console.log("dynamic object:", dyn.name, dyn._getItem("name"), dyn.version, dyn._toJsonString());
+
         //=================
 
         console.log("123 + 456 =", GAny.op(123, "+", 456));

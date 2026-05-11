@@ -32,6 +32,85 @@ private:
     JSValue mJsFunc;
 };
 
+namespace
+{
+GAny *getGAnyOpaque(JSContext *ctx, JSValueConst obj)
+{
+    const auto *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
+    if (!jsState) {
+        return nullptr;
+    }
+    return static_cast<GAny *>(JS_GetOpaque(obj, jsState->ganyClassID));
+}
+
+bool atomToGAnyKey(JSContext *ctx, JSAtom prop, GAny &key)
+{
+    const auto *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
+    if (!jsState) {
+        return false;
+    }
+
+    const JSValue propValue = JS_AtomToValue(ctx, prop);
+    if (JS_IsException(propValue)) {
+        return false;
+    }
+
+    if (JS_IsSymbol(propValue)) {
+        JS_FreeValue(ctx, propValue);
+        return false;
+    }
+
+    key = GAnyToQJS::makeJsValueToGAny(jsState, propValue);
+    JS_FreeValue(ctx, propValue);
+    return true;
+}
+
+bool tryGetGAnyOwnItem(JSContext *ctx, JSValueConst obj, JSAtom prop, GAny &value)
+{
+    GAny *anyV = getGAnyOpaque(ctx, obj);
+    if (!anyV) {
+        return false;
+    }
+
+    GAny key;
+    if (!atomToGAnyKey(ctx, prop, key)) {
+        return false;
+    }
+
+    switch (anyV->type()) {
+        case AnyType::object_t: {
+            if (!key.isString()) {
+                return false;
+            }
+
+            const auto &name = *key.as<std::string>();
+            const auto &objValue = *anyV->as<GAnyObject>();
+            if (!objValue.contains(name)) {
+                return false;
+            }
+
+            value = objValue[name];
+            return true;
+        }
+        case AnyType::array_t: {
+            if (!key.isInt()) {
+                return false;
+            }
+
+            const int32_t index = key.toInt32();
+            if (index < 0 || index >= anyV->length()) {
+                return false;
+            }
+
+            value = anyV->getItem(index);
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+}
+
 bool GAnyToQJS::toJS(JS_State *jsState, bool isWorker)
 {
     CHECK_CONDITION_R(jsState->ganyClassID == 0, false);
@@ -48,9 +127,17 @@ bool GAnyToQJS::toJS(JS_State *jsState, bool isWorker)
 
     CHECK_CONDITION_S_R(jsState->ganyClassID != 0, false, "Failed to create new class ID");
 
-    constexpr JSClassDef classDef{
+    static JSClassExoticMethods exoticMethods{
+        .get_own_property = JS_GAnyGetOwnProperty,
+        .get_own_property_names = JS_GAnyGetOwnPropertyNames,
+        .delete_property = JS_GAnyDeleteProperty,
+        .define_own_property = JS_GAnyDefineOwnProperty
+    };
+
+    JSClassDef classDef{
         .class_name = "GAny",
-        .finalizer = JS_GAnyFinalizer
+        .finalizer = JS_GAnyFinalizer,
+        .exotic = &exoticMethods
     };
     JS_NewClass(jsState->rt, jsState->ganyClassID, &classDef);
 
@@ -1286,6 +1373,112 @@ JSValue GAnyToQJS::JS_GAnyGetterSetter(JSContext *ctx, JSValue thisVal, int argc
         anyV->setItem(propName, makeJsValueToGAny(jsState, argv[0]));
     }
     return JS_UNDEFINED;
+}
+
+int GAnyToQJS::JS_GAnyGetOwnProperty(JSContext *ctx, JSPropertyDescriptor *desc, JSValueConst obj, JSAtom prop)
+{
+    GAny value;
+    if (!tryGetGAnyOwnItem(ctx, obj, prop, value)) {
+        return false;
+    }
+
+    if (desc) {
+        const auto *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
+        desc->flags = JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE | JS_PROP_ENUMERABLE;
+        desc->value = makeGAnyToJsValue(jsState, value, true);
+        desc->getter = JS_UNDEFINED;
+        desc->setter = JS_UNDEFINED;
+    }
+
+    return true;
+}
+
+int GAnyToQJS::JS_GAnyGetOwnPropertyNames(JSContext *ctx, JSPropertyEnum **ptab, uint32_t *plen, JSValueConst obj)
+{
+    GAny *anyV = getGAnyOpaque(ctx, obj);
+    if (!anyV) {
+        *ptab = nullptr;
+        *plen = 0;
+        return 0;
+    }
+
+    std::vector<JSAtom> atoms;
+    switch (anyV->type()) {
+        case AnyType::object_t: {
+            const auto &objValue = *anyV->as<GAnyObject>();
+            atoms.reserve(objValue.var.size());
+            for (const auto &item: objValue.var) {
+                atoms.push_back(JS_NewAtom(ctx, item.first.c_str()));
+            }
+            break;
+        }
+        case AnyType::array_t: {
+            atoms.reserve(anyV->length());
+            for (uint32_t i = 0; i < anyV->length(); ++i) {
+                atoms.push_back(JS_NewAtomUInt32(ctx, i));
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
+    *plen = static_cast<uint32_t>(atoms.size());
+    if (atoms.empty()) {
+        *ptab = nullptr;
+        return 0;
+    }
+
+    *ptab = static_cast<JSPropertyEnum *>(js_mallocz(ctx, sizeof(JSPropertyEnum) * atoms.size()));
+    if (!*ptab) {
+        for (const auto &atom: atoms) {
+            JS_FreeAtom(ctx, atom);
+        }
+        *plen = 0;
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < *plen; ++i) {
+        (*ptab)[i].atom = atoms[i];
+        (*ptab)[i].is_enumerable = 1;
+    }
+
+    return 0;
+}
+
+int GAnyToQJS::JS_GAnyDeleteProperty(JSContext *ctx, JSValueConst obj, JSAtom prop)
+{
+    GAny *anyV = getGAnyOpaque(ctx, obj);
+    if (!anyV) {
+        return true;
+    }
+
+    GAny key;
+    if (!atomToGAnyKey(ctx, prop, key)) {
+        return true;
+    }
+
+    return anyV->delItem(key);
+}
+
+int GAnyToQJS::JS_GAnyDefineOwnProperty(JSContext *ctx, JSValueConst thisObj, JSAtom prop, JSValueConst val, JSValueConst getter, JSValueConst setter, int flags)
+{
+    GAny *anyV = getGAnyOpaque(ctx, thisObj);
+    if (!anyV) {
+        return false;
+    }
+
+    GAny key;
+    if (!atomToGAnyKey(ctx, prop, key)) {
+        return JS_DefineProperty(ctx, thisObj, prop, val, getter, setter, flags | JS_PROP_NO_EXOTIC);
+    }
+
+    if (!(flags & JS_PROP_HAS_VALUE) || !JS_IsUndefined(getter) || !JS_IsUndefined(setter)) {
+        return JS_DefineProperty(ctx, thisObj, prop, val, getter, setter, flags | JS_PROP_NO_EXOTIC);
+    }
+
+    const auto *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
+    return anyV->setItem(key, makeJsValueToGAny(jsState, val));
 }
 
 // ================================================================

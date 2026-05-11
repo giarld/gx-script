@@ -135,6 +135,14 @@ private:
 
     static JSValue JS_GAnyGetterSetter(JSContext *ctx, JSValue thisVal, int argc, JSValue *argv, int magic, JSValue *funcData);
 
+    static int JS_GAnyGetOwnProperty(JSContext *ctx, JSPropertyDescriptor *desc, JSValueConst obj, JSAtom prop);
+
+    static int JS_GAnyGetOwnPropertyNames(JSContext *ctx, JSPropertyEnum **ptab, uint32_t *plen, JSValueConst obj);
+
+    static int JS_GAnyDeleteProperty(JSContext *ctx, JSValueConst obj, JSAtom prop);
+
+    static int JS_GAnyDefineOwnProperty(JSContext *ctx, JSValueConst thisObj, JSAtom prop, JSValueConst val, JSValueConst getter, JSValueConst setter, int flags);
+
 private:
     static GAny getGAnyClassDB();
 
