@@ -399,8 +399,6 @@ JSValue GAnyToQJS::makeGAnyToJsValue(const JS_State *jsState, const GAny &value,
         }
     }
 
-    GAny *any = GX_NEW(GAny, value);
-
     const JSValue proto = JS_NewObject(ctx);
 
     setGAnyGeneralProto(jsState, proto);
@@ -433,7 +431,19 @@ JSValue GAnyToQJS::makeGAnyToJsValue(const JS_State *jsState, const GAny &value,
         }
     }
 
-    const GAnyClass &clazz = value.classObject();
+    setGAnyInstanceProto(jsState, proto, value.classObject());
+
+    const JSValue obj = makeGAnyObjectWithProto(jsState, value, proto);
+
+    JS_FreeValue(ctx, proto);
+
+    return obj;
+}
+
+void GAnyToQJS::setGAnyInstanceProto(const JS_State *jsState, JSValue proto, const GAnyClass &clazz)
+{
+    JSContext *ctx = jsState->ctx;
+
     const auto members = clazz.getMembers(true);
     for (const auto &i: members) {
         std::string _name = i.first;
@@ -452,10 +462,18 @@ JSValue GAnyToQJS::makeGAnyToJsValue(const JS_State *jsState, const GAny &value,
 
         JS_FreeValue(ctx, _nameValue);
     }
+}
 
+JSValue GAnyToQJS::makeGAnyObjectWithProto(const JS_State *jsState, const GAny &value, JSValueConst proto)
+{
+    JSContext *ctx = jsState->ctx;
+
+    GAny *any = GX_NEW(GAny, value);
     const JSValue obj = JS_NewObjectProtoClass(ctx, proto, jsState->ganyClassID);
-
-    JS_FreeValue(ctx, proto);
+    if (JS_IsException(obj)) {
+        GX_DELETE(any);
+        return obj;
+    }
 
     JS_SetOpaque(obj, any);
     return obj;
@@ -512,6 +530,7 @@ void GAnyToQJS::setGAnyGeneralProto(const JS_State *jsState, JSValue proto)
     JS_SetPropertyStr(ctx, proto, "_toFloat", JS_NewCFunction(ctx, JS_GAnyToFloat, "_toFloat", 0));
     JS_SetPropertyStr(ctx, proto, "_toBool", JS_NewCFunction(ctx, JS_GAnyToBool, "_toBool", 0));
     JS_SetPropertyStr(ctx, proto, "_toJsValue", JS_NewCFunction(ctx, JS_GAnyToJsValue, "_toJsValue", 0));
+    JS_SetPropertyStr(ctx, proto, "_toJsClass", JS_NewCFunction(ctx, JS_GAnyToJsClass, "_toJsClass", 0));
 
     JS_SetPropertyStr(ctx, proto, "_toJsonString", JS_NewCFunction(ctx, JS_GAnyToJsonString, "_toJsonString", 0));
     JS_SetPropertyStr(ctx, proto, "_contains", JS_NewCFunction(ctx, JS_GAnyContains, "_contains", 1));
@@ -1119,6 +1138,91 @@ JSValue GAnyToQJS::JS_GAnyToJsValue(JSContext *ctx, JSValue thisVal, int /*argc*
     const GAny *anyV = static_cast<GAny *>(JS_GetOpaque(thisVal, jsState->ganyClassID));
 
     return makeGAnyToJsValue(jsState, *anyV, false);
+}
+
+JSValue GAnyToQJS::JS_GAnyToJsClass(JSContext *ctx, JSValue thisVal, int /*argc*/, JSValue */*argv*/)
+{
+    const JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
+    const GAny *anyV = static_cast<GAny *>(JS_GetOpaque(thisVal, jsState->ganyClassID));
+
+    if (!anyV || !anyV->isClass()) {
+        JS_ThrowTypeError(ctx, "This is not a class");
+        return JS_EXCEPTION;
+    }
+
+    const GAnyClass &clazz = *anyV->as<GAnyClass>();
+
+    const JSValue proto = JS_NewObject(ctx);
+    if (JS_IsException(proto)) {
+        return proto;
+    }
+
+    setGAnyGeneralProto(jsState, proto);
+    setGAnyInstanceProto(jsState, proto, clazz);
+
+    const JSValue classValue = makeGAnyToJsValue(jsState, *anyV, false);
+    if (JS_IsException(classValue)) {
+        JS_FreeValue(ctx, proto);
+        return classValue;
+    }
+
+    JSValue data[1] = {classValue};
+    JSValue constructor = JS_NewCFunctionData(ctx, JS_GAnyJsClassConstructor, 0, 0, 1, data);
+    JS_FreeValue(ctx, classValue);
+    if (JS_IsException(constructor)) {
+        JS_FreeValue(ctx, proto);
+        return constructor;
+    }
+
+    JS_SetConstructorBit(ctx, constructor, true);
+    JS_SetConstructor(ctx, constructor, proto);
+    JS_DefinePropertyValueStr(ctx, constructor, "name", JS_NewString(ctx, clazz.getName().c_str()),
+                              JS_PROP_CONFIGURABLE);
+
+    JS_FreeValue(ctx, proto);
+    return constructor;
+}
+
+JSValue GAnyToQJS::JS_GAnyJsClassConstructor(JSContext *ctx, JSValue thisVal, int argc, JSValue *argv,
+                                             int /*magic*/, JSValue *funcData)
+{
+    const JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
+
+    if (!JS_IsConstructor(ctx, thisVal)) {
+        JS_ThrowTypeError(ctx, "Class constructor must be called with new");
+        return JS_EXCEPTION;
+    }
+
+    const GAny *classAny = static_cast<GAny *>(JS_GetOpaque(funcData[0], jsState->ganyClassID));
+    if (!classAny || !classAny->isClass()) {
+        JS_ThrowTypeError(ctx, "This is not a class");
+        return JS_EXCEPTION;
+    }
+
+    std::vector<GAny> tArgs;
+    tArgs.reserve(argc);
+    for (int i = 0; i < argc; i++) {
+        tArgs.push_back(makeJsValueToGAny(jsState, argv[i]));
+    }
+
+    GAny rObj = classAny->_call(tArgs);
+    if (rObj.isException()) {
+        JS_ThrowInternalError(ctx, "%s", rObj.as<GAnyException>()->what());
+        return JS_EXCEPTION;
+    }
+
+    JSValue proto = JS_GetPropertyStr(ctx, thisVal, "prototype");
+    if (JS_IsException(proto)) {
+        return proto;
+    }
+    if (!JS_IsObject(proto) && !JS_IsNull(proto)) {
+        JS_FreeValue(ctx, proto);
+        proto = JS_NULL;
+    }
+
+    JSValue obj = makeGAnyObjectWithProto(jsState, rObj, proto);
+    JS_FreeValue(ctx, proto);
+    return obj;
 }
 
 JSValue GAnyToQJS::JS_GAnyToPrimitive(JSContext *ctx, JSValue thisVal, int argc, JSValue *argv)

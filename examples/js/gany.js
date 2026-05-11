@@ -153,6 +153,13 @@ class GAnyUserObject {
     _toJsValue() {}
 
     /**
+     * 当当前对象是 GAnyClass 时，将其转换为可用 `new` 调用的 JS constructor。
+     * constructor 创建的实例仍然是 GAnyUserObject，可无损传回 GAny/C++。
+     * @returns {Function} JS constructor。
+     */
+    _toJsClass() {}
+
+    /**
      * 将 GAny 对象转换为 JSON 字符串。
      * @param {number} [indent=-1] - 缩进空格数。-1 表示不缩进。
      * @returns {string} JSON 字符串。
@@ -291,7 +298,7 @@ class GAnyIterator extends GAnyUserObject {
 /**
  * @class GAnyClass
  * @description 代表一个 GAny Class 定义，导入或创建在 JS 中。
- * 它继承自 GAnyUserObject 并添加了 'new' 方法用于实例化。
+ * 它继承自 GAnyUserObject 并添加了 'new' 方法用于实例化，也可以通过 `_toJsClass()` 转换为 JS constructor。
  * 它也可能包含静态方法和属性。
  * @extends GAnyUserObject
  */

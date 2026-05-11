@@ -37,6 +37,13 @@
         o.c = 123;
         o.pt();
 
+        const MyJsCtor = MyJsType._toJsClass();
+
+        let o2 = new MyJsCtor(3, 4);
+        o2.c = 456;
+        o2.pt();
+        console.log("js class:", o2 instanceof MyJsCtor, o2._isUserObject(), GAny.create(o2)._isUserObject());
+
         let dyn = GAny.create({});
         dyn.name = "gany";
         dyn["version"] = 1;

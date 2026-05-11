@@ -25,6 +25,10 @@ public:
 private:
     static void setGAnyGeneralProto(const JS_State *jsState, JSValue proto);
 
+    static void setGAnyInstanceProto(const JS_State *jsState, JSValue proto, const GAnyClass &clazz);
+
+    static JSValue makeGAnyObjectWithProto(const JS_State *jsState, const GAny &value, JSValueConst proto);
+
     static void JS_GAnyFinalizer(JSRuntime *rt, JSValue val);
 
     static JSValue JS_GAnyCreate(JSContext *ctx, JSValue thisVal, int argc, JSValue *argv);
@@ -103,6 +107,10 @@ private:
     static JSValue JS_GAnyToBool(JSContext *ctx, JSValue thisVal, int argc, JSValue *argv);
 
     static JSValue JS_GAnyToJsValue(JSContext *ctx, JSValue thisVal, int argc, JSValue *argv);
+
+    static JSValue JS_GAnyToJsClass(JSContext *ctx, JSValue thisVal, int argc, JSValue *argv);
+
+    static JSValue JS_GAnyJsClassConstructor(JSContext *ctx, JSValue thisVal, int argc, JSValue *argv, int magic, JSValue *funcData);
 
     static JSValue JS_GAnyToPrimitive(JSContext *ctx, JSValue thisVal, int argc, JSValue *argv);
 
