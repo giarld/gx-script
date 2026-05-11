@@ -17,6 +17,8 @@ public:
 
     static bool releaseJS(JS_State *jsState);
 
+    static void releaseJSFunctionRefs(const JS_State *jsState);
+
 public:
     static GAny makeJsValueToGAny(const JS_State *jsState, const JSValue &value);
 
@@ -28,6 +30,8 @@ private:
     static void setGAnyInstanceProto(const JS_State *jsState, JSValue proto, const GAnyClass &clazz);
 
     static JSValue makeGAnyObjectWithProto(const JS_State *jsState, const GAny &value, JSValueConst proto);
+
+    static JSValue makeGAnyClassToJsConstructor(const JS_State *jsState, const GAny &value);
 
     static void JS_GAnyFinalizer(JSRuntime *rt, JSValue val);
 

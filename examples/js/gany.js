@@ -353,11 +353,12 @@ const GAny = {
     createWorkerCallable: function(input, env = {}) {},
 
     /**
-     * 从 C++ 注册表中导入一个 GAny 类。
+     * 从 C++ 注册表中导入一个 GAny 类或命名空间对象。
      * @param {string} path - 类的完整路径 (例如 "Core.Vector3" 或 "MyGame.Player")。
-     * @returns {GAnyUserObject|any} 代表导入的 GAny 类的 GAny 对象 (可以使用 `new` 创建实例)。
+     * @param {{constructor?: boolean}} [options] - 导入选项；当 `constructor` 为 true 且 path 指向 GAnyClass 时返回 JS constructor。
+     * @returns {GAnyUserObject|Function|any} 代表导入结果的 GAny 对象，或可用 `new` 调用的 JS constructor。
      */
-    import: function(path) { },
+    import: function(path, options = undefined) { },
 
     /**
      * 解析 JSON 字符串并返回一个 GAny 对象 (通常是 GAnyUserObject 或 GAnyArray)。

@@ -6,6 +6,10 @@
 
 #include "gx/debug.h"
 
+#include <mutex>
+#include <set>
+#include <vector>
+
 
 class JSFunctionRef
 {
@@ -15,11 +19,17 @@ public:
     {
         GX_ASSERT(JS_IsFunction(jsCtx, func));
         mJsFunc = JS_DupValue(jsCtx, func);
+
+        std::lock_guard lock(sMutex);
+        sRefs.insert(this);
     }
 
     ~JSFunctionRef()
     {
-        JS_FreeValue(mJsCtx, mJsFunc);
+        release();
+
+        std::lock_guard lock(sMutex);
+        sRefs.erase(this);
     }
 
     JSValue getJSValue() const
@@ -27,10 +37,41 @@ public:
         return mJsFunc;
     }
 
+    void release()
+    {
+        if (!JS_IsUndefined(mJsFunc)) {
+            JS_FreeValue(mJsCtx, mJsFunc);
+            mJsFunc = JS_UNDEFINED;
+        }
+    }
+
+    static void releaseAll(JSContext *jsCtx)
+    {
+        std::vector<JSFunctionRef *> refs;
+        {
+            std::lock_guard lock(sMutex);
+            for (auto *ref: sRefs) {
+                if (ref->mJsCtx == jsCtx) {
+                    refs.push_back(ref);
+                }
+            }
+        }
+
+        for (auto *ref: refs) {
+            ref->release();
+        }
+    }
+
 private:
     JSContext *mJsCtx;
-    JSValue mJsFunc;
+    JSValue mJsFunc = JS_UNDEFINED;
+
+    static std::mutex sMutex;
+    static std::set<JSFunctionRef *> sRefs;
 };
+
+std::mutex JSFunctionRef::sMutex;
+std::set<JSFunctionRef *> JSFunctionRef::sRefs;
 
 namespace
 {
@@ -146,7 +187,7 @@ bool GAnyToQJS::toJS(JS_State *jsState, bool isWorker)
 
     JS_SetPropertyStr(jsState->ctx, cppObj, "create", JS_NewCFunction(jsState->ctx, JS_GAnyCreate, "create", 1));
     JS_SetPropertyStr(jsState->ctx, cppObj, "createWorkerCallable", JS_NewCFunction(jsState->ctx, JS_GAnyCreateWorkerCallable, "createWorkerCallable", 1));
-    JS_SetPropertyStr(jsState->ctx, cppObj, "import", JS_NewCFunction(jsState->ctx, JS_GAnyImport, "import", 1));
+    JS_SetPropertyStr(jsState->ctx, cppObj, "import", JS_NewCFunction(jsState->ctx, JS_GAnyImport, "import", 2));
     JS_SetPropertyStr(jsState->ctx, cppObj, "parseJson", JS_NewCFunction(jsState->ctx, JS_GAnyParseJson, "parseJson", 1));
     JS_SetPropertyStr(jsState->ctx, cppObj, "class", JS_NewCFunction(jsState->ctx, JS_GAnyClass, "class", 0));
     JS_SetPropertyStr(jsState->ctx, cppObj, "op", JS_NewCFunction(jsState->ctx, JS_GAnyOp, "op", 0));
@@ -173,7 +214,18 @@ bool GAnyToQJS::releaseJS(JS_State *jsState)
     }
     jsState->ganyModuleIdx = 0;
 
+    releaseJSFunctionRefs(jsState);
+
     return true;
+}
+
+void GAnyToQJS::releaseJSFunctionRefs(const JS_State *jsState)
+{
+    if (!jsState || !jsState->ctx) {
+        return;
+    }
+
+    JSFunctionRef::releaseAll(jsState->ctx);
 }
 
 
@@ -479,6 +531,48 @@ JSValue GAnyToQJS::makeGAnyObjectWithProto(const JS_State *jsState, const GAny &
     return obj;
 }
 
+JSValue GAnyToQJS::makeGAnyClassToJsConstructor(const JS_State *jsState, const GAny &value)
+{
+    JSContext *ctx = jsState->ctx;
+
+    if (!value.isClass()) {
+        JS_ThrowTypeError(ctx, "This is not a class");
+        return JS_EXCEPTION;
+    }
+
+    const GAnyClass &clazz = *value.as<GAnyClass>();
+
+    const JSValue proto = JS_NewObject(ctx);
+    if (JS_IsException(proto)) {
+        return proto;
+    }
+
+    setGAnyGeneralProto(jsState, proto);
+    setGAnyInstanceProto(jsState, proto, clazz);
+
+    const JSValue classValue = makeGAnyToJsValue(jsState, value, false);
+    if (JS_IsException(classValue)) {
+        JS_FreeValue(ctx, proto);
+        return classValue;
+    }
+
+    JSValue data[1] = {classValue};
+    JSValue constructor = JS_NewCFunctionData(ctx, JS_GAnyJsClassConstructor, 0, 0, 1, data);
+    JS_FreeValue(ctx, classValue);
+    if (JS_IsException(constructor)) {
+        JS_FreeValue(ctx, proto);
+        return constructor;
+    }
+
+    JS_SetConstructorBit(ctx, constructor, true);
+    JS_SetConstructor(ctx, constructor, proto);
+    JS_DefinePropertyValueStr(ctx, constructor, "name", JS_NewString(ctx, clazz.getName().c_str()),
+                              JS_PROP_CONFIGURABLE);
+
+    JS_FreeValue(ctx, proto);
+    return constructor;
+}
+
 void GAnyToQJS::setGAnyGeneralProto(const JS_State *jsState, JSValue proto)
 {
     JSContext *ctx = jsState->ctx;
@@ -639,7 +733,7 @@ JSValue GAnyToQJS::JS_GAnyCreateWorkerCallable(JSContext *ctx, JSValue /*thisVal
 
 JSValue GAnyToQJS::JS_GAnyImport(JSContext *ctx, JSValue /*thisVal*/, int argc, JSValue *argv)
 {
-    if (argc != 1) {
+    if (argc != 1 && argc != 2) {
         JS_ThrowInternalError(ctx, "Wrong number of argc");
         return JS_EXCEPTION;
     }
@@ -656,10 +750,33 @@ JSValue GAnyToQJS::JS_GAnyImport(JSContext *ctx, JSValue /*thisVal*/, int argc, 
     const std::string path(str);
     JS_FreeCString(ctx, str);
 
+    bool asConstructor = false;
+    if (argc == 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        if (!JS_IsObject(argv[1])) {
+            JS_ThrowTypeError(ctx, "Import options must be an object");
+            return JS_EXCEPTION;
+        }
+
+        JSValue constructorOption = JS_GetPropertyStr(ctx, argv[1], "constructor");
+        if (JS_IsException(constructorOption)) {
+            return constructorOption;
+        }
+        const int constructorEnabled = JS_ToBool(ctx, constructorOption);
+        JS_FreeValue(ctx, constructorOption);
+        if (constructorEnabled < 0) {
+            return JS_EXCEPTION;
+        }
+        asConstructor = constructorEnabled == 1;
+    }
+
     const GAny ret = GAny::Import(path);
     if (ret.isNull()) {
         JS_ThrowInternalError(ctx, "Class not found");
         return JS_EXCEPTION;
+    }
+
+    if (asConstructor) {
+        return makeGAnyClassToJsConstructor(jsState, ret);
     }
 
     return makeGAnyToJsValue(jsState, ret, ret.isObject());
@@ -1145,42 +1262,12 @@ JSValue GAnyToQJS::JS_GAnyToJsClass(JSContext *ctx, JSValue thisVal, int /*argc*
     const JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
     const GAny *anyV = static_cast<GAny *>(JS_GetOpaque(thisVal, jsState->ganyClassID));
 
-    if (!anyV || !anyV->isClass()) {
+    if (!anyV) {
         JS_ThrowTypeError(ctx, "This is not a class");
         return JS_EXCEPTION;
     }
 
-    const GAnyClass &clazz = *anyV->as<GAnyClass>();
-
-    const JSValue proto = JS_NewObject(ctx);
-    if (JS_IsException(proto)) {
-        return proto;
-    }
-
-    setGAnyGeneralProto(jsState, proto);
-    setGAnyInstanceProto(jsState, proto, clazz);
-
-    const JSValue classValue = makeGAnyToJsValue(jsState, *anyV, false);
-    if (JS_IsException(classValue)) {
-        JS_FreeValue(ctx, proto);
-        return classValue;
-    }
-
-    JSValue data[1] = {classValue};
-    JSValue constructor = JS_NewCFunctionData(ctx, JS_GAnyJsClassConstructor, 0, 0, 1, data);
-    JS_FreeValue(ctx, classValue);
-    if (JS_IsException(constructor)) {
-        JS_FreeValue(ctx, proto);
-        return constructor;
-    }
-
-    JS_SetConstructorBit(ctx, constructor, true);
-    JS_SetConstructor(ctx, constructor, proto);
-    JS_DefinePropertyValueStr(ctx, constructor, "name", JS_NewString(ctx, clazz.getName().c_str()),
-                              JS_PROP_CONFIGURABLE);
-
-    JS_FreeValue(ctx, proto);
-    return constructor;
+    return makeGAnyClassToJsConstructor(jsState, *anyV);
 }
 
 JSValue GAnyToQJS::JS_GAnyJsClassConstructor(JSContext *ctx, JSValue thisVal, int argc, JSValue *argv,

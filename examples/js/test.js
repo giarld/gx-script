@@ -1,6 +1,6 @@
 (function(Env) {
     async function main() {
-        let say = await import("./test_module.js");
+        const say = await import("./test_module.js");
         let os = await import("qjs:os");
 
         say.sayHi("JS");
@@ -31,13 +31,14 @@
             }
         }, true);
 
-        const MyJsType = GAny.import("Js.MyJsType");
+        // const MyJsType = GAny.import("Js.MyJsType");
+        const {MyJsType} = await import("gany:Js");
 
         let o = MyJsType.new(1, 2)
         o.c = 123;
         o.pt();
 
-        const MyJsCtor = MyJsType._toJsClass();
+        const MyJsCtor = GAny.import("Js.MyJsType", { constructor: true });
 
         let o2 = new MyJsCtor(3, 4);
         o2.c = 456;

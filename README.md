@@ -30,6 +30,14 @@ import { Float3 } from "gany:Math.Float3";
 const position = Float3.new(0, 1, 0);
 ```
 
+To use a GAny class as a JavaScript constructor, pass
+`{ constructor: true }` when importing an exact class path.
+
+```js
+const Float3Ctor = GAny.import("Math.Float3", { constructor: true });
+const position = new Float3Ctor(0, 1, 0);
+```
+
 Dynamic `import()` is also supported. Use it when the GAny module is only needed
 inside an async flow or callback.
 
