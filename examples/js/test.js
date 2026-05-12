@@ -15,11 +15,11 @@
             __namespace: "Js",
             __doc: "A Js GAny Class",
             __init: function (self, a, b) {
-                self._setItem("a", a);
+                self.a = a;
                 self._setItem("b", b);
             },
             pt: function (self) {
-                console.log("MM: a =", self._getItem("a"), ", b =", self._getItem("b"), ", c =", self.c);
+                console.log("MM: a =", self._getItem("a"), ", b =", self.b, ", c =", self.c);
             },
             c: {
                 set: function (self, v) {

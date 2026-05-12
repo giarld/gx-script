@@ -106,6 +106,22 @@ bool atomToGAnyKey(JSContext *ctx, JSAtom prop, GAny &key)
     return true;
 }
 
+bool shouldUseGAnyGetItemFallback(const GAny &value, const GAny &key)
+{
+    if (!key.isString()) {
+        return true;
+    }
+
+    const auto &name = *key.as<std::string>();
+    if (value.classObject().containsMember(name, true)) {
+        return false;
+    }
+    if (value.isClass() && value.as<GAnyClass>()->containsMember(name, true)) {
+        return false;
+    }
+    return true;
+}
+
 bool tryGetGAnyOwnItem(JSContext *ctx, JSValueConst obj, JSAtom prop, GAny &value)
 {
     GAny *anyV = getGAnyOpaque(ctx, obj);
@@ -127,7 +143,7 @@ bool tryGetGAnyOwnItem(JSContext *ctx, JSValueConst obj, JSAtom prop, GAny &valu
             const auto &name = *key.as<std::string>();
             const auto &objValue = *anyV->as<GAnyObject>();
             if (!objValue.contains(name)) {
-                return false;
+                break;
             }
 
             value = objValue[name];
@@ -147,8 +163,15 @@ bool tryGetGAnyOwnItem(JSContext *ctx, JSValueConst obj, JSAtom prop, GAny &valu
             return true;
         }
         default:
-            return false;
+            break;
     }
+
+    if (!shouldUseGAnyGetItemFallback(*anyV, key)) {
+        return false;
+    }
+
+    value = anyV->getItem(key);
+    return !value.isUndefined() && !value.isException();
 }
 }
 
