@@ -12,7 +12,7 @@
 #include <lua.hpp>
 
 
-#define glua_getcppobject(L, CLASS, i)  (lua_isuserdata(L, i) ? *(CLASS**)lua_touserdata(L, i) : nullptr)
+#define glua_getcppobject(L, CLASS, i)  (lua_isuserdata(L, i) ? static_cast<CLASS*>(lua_touserdata(L, i)) : nullptr)
 
 class LuaFunction;
 

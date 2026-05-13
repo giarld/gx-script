@@ -15,6 +15,7 @@
 
 #include <math.h>
 
+#include <new>
 #include <set>
 #include <utility>
 
@@ -341,10 +342,8 @@ void GAnyLuaImpl::removeLFunctionRef(const std::shared_ptr<LuaFunction> &ref)
 
 void GAnyLuaImpl::pushGAny(lua_State *L, const GAny &v)
 {
-    GAny *obj = GX_NEW(GAny, v);
-
-    void **p = static_cast<void **>(lua_newuserdata(L, sizeof(void *)));
-    *p = obj;
+    void *p = lua_newuserdata(L, sizeof(GAny));
+    new (p) GAny(v);
     luaL_getmetatable(L, "GAny");
     lua_setmetatable(L, -2);
 }

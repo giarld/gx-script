@@ -8,6 +8,75 @@
 
 #include <gx/debug.h>
 
+#include <algorithm>
+#include <array>
+#include <cstring>
+
+namespace
+{
+constexpr std::array<const char *, 47> GANY_LUA_METHODS = {
+    "_call",
+    "_classObject",
+    "_classTypeName",
+    "_clear",
+    "_clone",
+    "_contains",
+    "_delItem",
+    "_dump",
+    "_erase",
+    "_get",
+    "_getItem",
+    "_hasNext",
+    "_is",
+    "_isArray",
+    "_isBoolean",
+    "_isClass",
+    "_isDouble",
+    "_isException",
+    "_isFloat",
+    "_isFunction",
+    "_isInt",
+    "_isNull",
+    "_isNumber",
+    "_isObject",
+    "_isProperty",
+    "_isString",
+    "_isTable",
+    "_isUndefined",
+    "_isUserObject",
+    "_iterator",
+    "_length",
+    "_next",
+    "_pushBack",
+    "_setItem",
+    "_size",
+    "_toBool",
+    "_toDouble",
+    "_toFloat",
+    "_toInt32",
+    "_toInt64",
+    "_toJsonString",
+    "_toObject",
+    "_toString",
+    "_toTable",
+    "_type",
+    "_typeName",
+    "new"
+};
+
+bool isGAnyLuaMethod(const char *name)
+{
+    return std::binary_search(
+        GANY_LUA_METHODS.begin(),
+        GANY_LUA_METHODS.end(),
+        name,
+        [](const char *lhs, const char *rhs) {
+            return std::strcmp(lhs, rhs) < 0;
+        }
+    );
+}
+}
+
 
 void GAnyToLua::toLua(lua_State *L)
 {
@@ -124,6 +193,7 @@ void GAnyToLua::toLua(lua_State *L)
         lua_pushcfunction(L, f->func);
         lua_settable(L, top);
     }
+
     lua_pop(L, lua_gettop(L));
 
 
@@ -429,24 +499,19 @@ int GAnyToLua::regGAnyCreate(lua_State *L)
         return 0;
     }
 
-    GAny *obj = GX_NEW(GAny, argv);
-
-    void **p = static_cast<void **>(lua_newuserdata(L, sizeof(void *)));
-    *p = obj;
-    luaL_getmetatable(L, "GAny");
-    lua_setmetatable(L, -2);
+    GAnyLuaImpl::pushGAny(L, argv);
 
     return 1;
 }
 
 int GAnyToLua::regGAnyGC(lua_State *L)
 {
-    const GAny *self = glua_getcppobject(L, GAny, 1);
+    GAny *self = glua_getcppobject(L, GAny, 1);
     if (!self) {
         luaL_error(L, "Call GAny __gc error: null object");
         return 0;
     }
-    GX_DELETE(self);
+    self->~GAny();
 
     return 0;
 }
@@ -455,12 +520,15 @@ int GAnyToLua::regGAnyLIndex(lua_State *L)
 {
     if (lua_type(L, -1) == LUA_TSTRING) {
         const char *name = lua_tostring(L, -1);
-        luaL_getmetatable(L, "GAny");
-        lua_getfield(L, -1, name);
-        if (lua_iscfunction(L, -1)) {
-            return 1;
+        if (isGAnyLuaMethod(name)) {
+            luaL_getmetatable(L, "GAny");
+            lua_getfield(L, -1, name);
+            if (lua_iscfunction(L, -1)) {
+                lua_remove(L, -2);
+                return 1;
+            }
+            lua_pop(L, 2);
         }
-        lua_pop(L, 2);
     }
 
     if (lua_gettop(L) != 2) {
@@ -472,6 +540,29 @@ int GAnyToLua::regGAnyLIndex(lua_State *L)
     if (!self) {
         luaL_error(L, "Call GAny __index error: null object");
         return 0;
+    }
+
+    switch (lua_type(L, 2)) {
+        case LUA_TSTRING: {
+            size_t len = 0;
+            const char *key = lua_tolstring(L, 2, &len);
+            GAnyLuaImpl::makeGAnyToLuaObject(L, self->getItem(std::string(key, len)), true);
+            return 1;
+        }
+        case LUA_TNUMBER: {
+            if (lua_isinteger(L, 2)) {
+                GAnyLuaImpl::makeGAnyToLuaObject(
+                    L,
+                    self->getItem(static_cast<int64_t>(lua_tointeger(L, 2))),
+                    true
+                );
+            } else {
+                GAnyLuaImpl::makeGAnyToLuaObject(L, self->getItem(lua_tonumber(L, 2)), true);
+            }
+            return 1;
+        }
+        default:
+            break;
     }
 
     GAny key = GAnyLuaImpl::makeLuaObjectToGAny(L, 2);
@@ -496,14 +587,34 @@ int GAnyToLua::regGAnyLNewIndex(lua_State *L)
         return 0;
     }
 
-    GAny key = GAnyLuaImpl::makeLuaObjectToGAny(L, 2);
-    if (key.isException()) {
-        luaL_error(L, key.as<GAnyException>()->what());
-        return 0;
-    }
     GAny val = GAnyLuaImpl::makeLuaObjectToGAny(L, 3);
     if (val.isException()) {
         luaL_error(L, val.as<GAnyException>()->what());
+        return 0;
+    }
+
+    switch (lua_type(L, 2)) {
+        case LUA_TSTRING: {
+            size_t len = 0;
+            const char *key = lua_tolstring(L, 2, &len);
+            self->setItem(std::string(key, len), val);
+            return 0;
+        }
+        case LUA_TNUMBER: {
+            if (lua_isinteger(L, 2)) {
+                self->setItem(static_cast<int64_t>(lua_tointeger(L, 2)), val);
+            } else {
+                self->setItem(lua_tonumber(L, 2), val);
+            }
+            return 0;
+        }
+        default:
+            break;
+    }
+
+    GAny key = GAnyLuaImpl::makeLuaObjectToGAny(L, 2);
+    if (key.isException()) {
+        luaL_error(L, key.as<GAnyException>()->what());
         return 0;
     }
     self->setItem(key, val);
