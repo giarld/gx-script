@@ -390,7 +390,7 @@ GAny GAnyToQJS::makeJsValueToGAny(const JS_State *jsState, const JSValue &value)
             JSValue msgVal = JS_GetPropertyStr(ctx, exception, "message");
             const char *msg = JS_ToCString(ctx, msgVal);
 
-            const bool isError = JS_IsError(ctx, exception);
+            const bool isError = JS_IsError(exception);
             JSValue stackVal;
             if (isError) {
                 stackVal = JS_GetPropertyStr(ctx, exception, "stack");

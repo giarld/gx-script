@@ -5,20 +5,20 @@
 #ifndef QJSCONF_H
 #define QJSCONF_H
 
-#if defined(BUILD_SHARED_LIBS)
+/*
+ * gx-script compatibility layer.
+ *
+ * quickjs-ng 0.14.0 moved symbol visibility handling into quickjs.h and uses
+ * BUILDING_QJS_SHARED while building qjs, and USING_QJS_SHARED for consumers.
+ * Keep this header so local integration points can continue to include it, but
+ * map the old BUILD_SHARED_LIBS convention to the new upstream macros.
+ */
+#if defined(BUILD_SHARED_LIBS) && defined(QUICKJS_NG_BUILD)
 #if defined(_WIN32) || defined(_WIN64)
-
-#define JS_EXTERN __declspec( dllexport )
-
-#else
-
-#define JS_EXTERN __attribute__((visibility("default")))
-
+#ifndef BUILDING_QJS_SHARED
+#define BUILDING_QJS_SHARED
 #endif
-#else
-
-#define JS_EXTERN extern
-
+#endif
 #endif
 
 #endif //QJSCONF_H

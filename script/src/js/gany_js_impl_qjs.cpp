@@ -365,7 +365,7 @@ bool GAnyJSImplQjs::onUpdate()
         std::string exceptionMsg;
 
         JSValue val;
-        const bool isError = JS_IsError(mJSContext, exceptionVal);
+        const bool isError = JS_IsError(exceptionVal);
 
         const char *str = JS_ToCString(mJSContext, exceptionVal);
         if (str) {
