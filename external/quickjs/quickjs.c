@@ -7682,9 +7682,50 @@ fail:
     return b->line_num;
 }
 
+typedef struct JSDebuggerLocalsState {
+    JSStackFrame *sf;
+    JSFunctionBytecode *b;
+} JSDebuggerLocalsState;
+
+static JSValue js_debugger_get_locals(JSContext *ctx, void *opaque)
+{
+    JSDebuggerLocalsState *s = opaque;
+    JSStackFrame *sf = s->sf;
+    JSFunctionBytecode *b = s->b;
+    JSValue locals;
+    int i;
+
+    locals = JS_NewObject(ctx);
+    if (JS_IsException(locals))
+        return JS_EXCEPTION;
+    if (b->vardefs) {
+        for(i = 0; i < b->arg_count && i < sf->arg_count; i++) {
+            JSAtom atom = b->vardefs[i].var_name;
+            if (atom != JS_ATOM_NULL && !JS_IsUninitialized(sf->arg_buf[i])) {
+                if (JS_SetProperty(ctx, locals, atom, JS_DupValue(ctx, sf->arg_buf[i])) < 0) {
+                    JS_FreeValue(ctx, locals);
+                    return JS_EXCEPTION;
+                }
+            }
+        }
+        for(i = 0; i < b->var_count; i++) {
+            JSAtom atom = b->vardefs[b->arg_count + i].var_name;
+            if (atom != JS_ATOM_NULL && !JS_IsUninitialized(sf->var_buf[i])) {
+                if (JS_SetProperty(ctx, locals, atom, JS_DupValue(ctx, sf->var_buf[i])) < 0) {
+                    JS_FreeValue(ctx, locals);
+                    return JS_EXCEPTION;
+                }
+            }
+        }
+    }
+    return locals;
+}
+
 static int js_debugger_poll(JSContext *ctx, JSFunctionBytecode *b, uint8_t *pc)
 {
     JSRuntime *rt = ctx->rt;
+    JSStackFrame *sf = rt->current_stack_frame;
+    JSDebuggerLocalsState locals_state;
     const char *filename;
     int line_num, col_num;
     uint32_t pc_value;
@@ -7696,8 +7737,11 @@ static int js_debugger_poll(JSContext *ctx, JSFunctionBytecode *b, uint8_t *pc)
     pc_value = pc - b->byte_code_buf;
     line_num = find_line_num(ctx, b, pc_value, &col_num);
     filename = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
+    locals_state.sf = sf;
+    locals_state.b = b;
     ret = rt->debugger_handler(ctx, filename ? filename : "<anonymous>",
-                               line_num, col_num, rt->current_stack_frame->debugger_frame_id,
+                               line_num, col_num, sf->debugger_frame_id,
+                               js_debugger_get_locals, &locals_state,
                                rt->debugger_opaque);
     JS_FreeCString(ctx, filename);
     if (ret) {

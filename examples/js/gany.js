@@ -390,7 +390,29 @@ const GxDebugger = {
      * @param {boolean} enabled - 是否打印 JS 堆栈。
      * @returns {void}
      */
-    setPrintStackOnBreak: function(enabled) {}
+    setPrintStackOnBreak: function(enabled) {},
+
+    /**
+     * 添加一个 watch expression。
+     *
+     * 表达式会在断点命中时基于当前 JS frame 的参数和局部变量求值。
+     * @param {string} expression - 要监视的 JS 表达式，例如 `"self.a"` 或 `"o2.c"`。
+     * @returns {void}
+     */
+    watch: function(expression) {},
+
+    /**
+     * 清除一个 watch expression。
+     * @param {string} expression - 要清除的表达式，必须与添加时的字符串一致。
+     * @returns {void}
+     */
+    clearWatch: function(expression) {},
+
+    /**
+     * 清除全部 watch expression。
+     * @returns {void}
+     */
+    clearAllWatches: function() {}
 };
 
 // ======================================================================

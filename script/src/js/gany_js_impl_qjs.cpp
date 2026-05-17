@@ -36,6 +36,8 @@ struct GxQjsDebuggerState
     bool pauseRequested = false;
     bool trapOnBreak = true;
     bool printStackOnBreak = true;
+    bool evaluatingWatches = false;
+    std::vector<std::string> watches;
     std::map<uint64_t, std::pair<std::string, int>> suppressedBreakpoints;
 };
 
@@ -54,7 +56,9 @@ static GxQjsDebuggerState *getDebuggerState(JSContext *ctx)
     return jsState ? static_cast<GxQjsDebuggerState *>(jsState->debuggerState) : nullptr;
 }
 
-static int gxQjsDebuggerPoll(JSContext *, const char *filename, int lineNum, int colNum, uint64_t frameId, void *opaque);
+static int gxQjsDebuggerPoll(JSContext *, const char *filename, int lineNum, int colNum,
+                             uint64_t frameId, JSDebuggerLocalsGetter *getLocals,
+                             void *getLocalsOpaque, void *opaque);
 
 static void updateDebuggerHandler(JSContext *ctx, GxQjsDebuggerState *state)
 {
@@ -197,6 +201,65 @@ static JSValue js_gxDebuggerSetPrintStackOnBreak(JSContext *ctx, JSValueConst, i
     return JS_UNDEFINED;
 }
 
+static JSValue js_gxDebuggerWatch(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
+{
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "watch(expression) expects 1 argument");
+    }
+
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+
+    const char *expr = JS_ToCString(ctx, argv[0]);
+    if (!expr) {
+        return JS_EXCEPTION;
+    }
+
+    state->watches.emplace_back(expr);
+    JS_FreeCString(ctx, expr);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_gxDebuggerClearWatch(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
+{
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "clearWatch(expression) expects 1 argument");
+    }
+
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+
+    const char *expr = JS_ToCString(ctx, argv[0]);
+    if (!expr) {
+        return JS_EXCEPTION;
+    }
+
+    const std::string target = expr;
+    JS_FreeCString(ctx, expr);
+    for (auto it = state->watches.begin(); it != state->watches.end(); ++it) {
+        if (*it == target) {
+            state->watches.erase(it);
+            break;
+        }
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue js_gxDebuggerClearAllWatches(JSContext *ctx, JSValueConst, int, JSValueConst *)
+{
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+
+    state->watches.clear();
+    return JS_UNDEFINED;
+}
+
 static bool isBreakpointFileMatch(const std::string &breakpointFile, const std::string &runtimeFile)
 {
     if (breakpointFile == runtimeFile) {
@@ -245,10 +308,81 @@ static void printCurrentJsStack(JSContext *ctx)
     JS_FreeValue(ctx, errorVal);
 }
 
-static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, int colNum, uint64_t frameId, void *opaque)
+static void printWatchException(JSContext *ctx, const std::string &expr)
+{
+    const JSValue exceptionVal = JS_GetException(ctx);
+    const char *exceptionStr = JS_ToCString(ctx, exceptionVal);
+    std::fprintf(stderr, "[GxDebugger] watch %s = <exception", expr.c_str());
+    if (exceptionStr) {
+        std::fprintf(stderr, ": %s", exceptionStr);
+        JS_FreeCString(ctx, exceptionStr);
+    }
+    std::fprintf(stderr, ">\n");
+    JS_FreeValue(ctx, exceptionVal);
+}
+
+static void beginWatchEvaluation(JSContext *ctx, GxQjsDebuggerState *state)
+{
+    state->evaluatingWatches = true;
+    JS_SetDebuggerHandler(JS_GetRuntime(ctx), nullptr, nullptr);
+}
+
+static void endWatchEvaluation(JSContext *ctx, GxQjsDebuggerState *state)
+{
+    state->evaluatingWatches = false;
+    updateDebuggerHandler(ctx, state);
+}
+
+static void printWatchValue(JSContext *ctx, GxQjsDebuggerState *state, JSValueConst locals, const std::string &expr)
+{
+    const std::string source = "(function(__gx_locals){ with (__gx_locals) { return (" + expr + "); } })";
+
+    beginWatchEvaluation(ctx, state);
+    JSValue funcVal = JS_Eval(ctx, source.c_str(), source.size(), "<gx-watch>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(funcVal)) {
+        endWatchEvaluation(ctx, state);
+        printWatchException(ctx, expr);
+        return;
+    }
+
+    JSValue argv[] = { JS_DupValue(ctx, locals) };
+    JSValue resultVal = JS_Call(ctx, funcVal, JS_UNDEFINED, 1, argv);
+    JS_FreeValue(ctx, argv[0]);
+    JS_FreeValue(ctx, funcVal);
+    endWatchEvaluation(ctx, state);
+
+    if (JS_IsException(resultVal)) {
+        printWatchException(ctx, expr);
+        return;
+    }
+
+    const char *resultStr = JS_ToCString(ctx, resultVal);
+    if (resultStr) {
+        std::fprintf(stderr, "[GxDebugger] watch %s = %s\n", expr.c_str(), resultStr);
+        JS_FreeCString(ctx, resultStr);
+    } else {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        std::fprintf(stderr, "[GxDebugger] watch %s = <unprintable>\n", expr.c_str());
+    }
+    JS_FreeValue(ctx, resultVal);
+}
+
+static void printWatches(JSContext *ctx, GxQjsDebuggerState *state, JSValueConst locals)
+{
+    for (const std::string &expr: state->watches) {
+        printWatchValue(ctx, state, locals, expr);
+    }
+}
+
+static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, int colNum,
+                             uint64_t frameId, JSDebuggerLocalsGetter *getLocals,
+                             void *getLocalsOpaque, void *opaque)
 {
     GxQjsDebuggerState *state = static_cast<GxQjsDebuggerState *>(opaque);
     if (!state || lineNum <= 0) {
+        return 0;
+    }
+    if (state->evaluatingWatches) {
         return 0;
     }
 
@@ -276,6 +410,16 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
     if (state->printStackOnBreak) {
         printCurrentJsStack(ctx);
     }
+    if (!state->watches.empty()) {
+        JSValue locals = getLocals(ctx, getLocalsOpaque);
+        if (JS_IsException(locals)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            std::fprintf(stderr, "[GxDebugger] failed to collect locals for watches\n");
+        } else {
+            printWatches(ctx, state, locals);
+            JS_FreeValue(ctx, locals);
+        }
+    }
     if (state->trapOnBreak) {
         nativeDebugBreak();
     }
@@ -301,6 +445,12 @@ static void installGxDebugger(JSContext *ctx, GxQjsDebuggerState *debuggerState)
                       JS_NewCFunction(ctx, js_gxDebuggerSetTrapOnBreak, "setTrapOnBreak", 1));
     JS_SetPropertyStr(ctx, debuggerObj, "setPrintStackOnBreak",
                       JS_NewCFunction(ctx, js_gxDebuggerSetPrintStackOnBreak, "setPrintStackOnBreak", 1));
+    JS_SetPropertyStr(ctx, debuggerObj, "watch",
+                      JS_NewCFunction(ctx, js_gxDebuggerWatch, "watch", 1));
+    JS_SetPropertyStr(ctx, debuggerObj, "clearWatch",
+                      JS_NewCFunction(ctx, js_gxDebuggerClearWatch, "clearWatch", 1));
+    JS_SetPropertyStr(ctx, debuggerObj, "clearAllWatches",
+                      JS_NewCFunction(ctx, js_gxDebuggerClearAllWatches, "clearAllWatches", 0));
     JS_SetPropertyStr(ctx, global, "GxDebugger", debuggerObj);
     JS_FreeValue(ctx, global);
     updateDebuggerHandler(ctx, debuggerState);
