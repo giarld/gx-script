@@ -12,6 +12,8 @@
 #include <cctype>
 #include <csignal>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <map>
 #include <set>
 #include <string>
@@ -39,6 +41,7 @@ struct GxDebuggerLocation
     int col = 0;
     uint64_t frameId = 0;
     uint32_t frameDepth = 0;
+    uint32_t pcOffset = 0;
 };
 
 struct GxDebuggerBreakpointView
@@ -46,6 +49,12 @@ struct GxDebuggerBreakpointView
     size_t id = 0;
     std::string file;
     int line = 0;
+    std::string condition;
+};
+
+struct GxDebuggerBreakpoint
+{
+    std::string condition;
 };
 
 struct GAnyModuleExports
@@ -57,7 +66,7 @@ struct GAnyModuleExports
 
 struct GxQjsDebuggerState
 {
-    std::set<std::pair<std::string, int>> breakpoints;
+    std::map<std::pair<std::string, int>, GxDebuggerBreakpoint> breakpoints;
     bool pauseRequested = false;
     bool resumeRequested = false;
     bool trapOnBreak = true;
@@ -65,6 +74,7 @@ struct GxQjsDebuggerState
     bool printStackOnBreak = true;
     bool evaluatingWatches = false;
     GxDebuggerStepKind stepKind = GxDebuggerStepKind::None;
+    bool stepSkipCurrentLocation = false;
     GxDebuggerLocation stepOrigin;
     std::vector<std::string> watches;
     std::map<uint64_t, std::pair<std::string, int>> suppressedBreakpoints;
@@ -86,12 +96,13 @@ static GxQjsDebuggerState *getDebuggerState(JSContext *ctx)
 }
 
 static int gxQjsDebuggerPoll(JSContext *, const char *filename, int lineNum, int colNum,
-                             uint64_t frameId, uint32_t frameDepth, JSDebuggerLocalsGetter *getLocals,
-                             void *getLocalsOpaque, void *opaque);
+                             uint64_t frameId, uint32_t frameDepth, uint32_t pcOffset,
+                             JSDebuggerLocalsGetter *getLocals, void *getLocalsOpaque, void *opaque);
 static std::string trimDebuggerCommand(const std::string &command);
 static std::vector<GxDebuggerBreakpointView> collectBreakpointViews(const GxQjsDebuggerState *state);
 static bool parseBreakpointSpec(JSContext *ctx, const std::string &spec, const std::string *currentFile,
                                 std::string *fileOut, int *lineOut);
+static bool splitBreakpointCondition(const std::string &spec, std::string *locationOut, std::string *conditionOut);
 static bool removeBreakpointBySpec(JSContext *ctx, GxQjsDebuggerState *state, const std::string &spec,
                                    const std::string *currentFile);
 static void printBreakpointList(const GxQjsDebuggerState *state);
@@ -165,10 +176,40 @@ static bool resolveBreakpointFileToken(JSContext *ctx, const std::string &fileTo
     return getCurrentSourceFile(ctx, fileOut);
 }
 
+static bool readBreakpointConditionOption(JSContext *ctx, int argc, JSValueConst *argv, std::string *conditionOut)
+{
+    if (!conditionOut) {
+        return false;
+    }
+    conditionOut->clear();
+    if (argc < 3 || JS_IsUndefined(argv[2]) || JS_IsNull(argv[2])) {
+        return true;
+    }
+
+    JSValue conditionVal = JS_GetPropertyStr(ctx, argv[2], "condition");
+    if (JS_IsException(conditionVal)) {
+        return false;
+    }
+    if (JS_IsUndefined(conditionVal) || JS_IsNull(conditionVal)) {
+        JS_FreeValue(ctx, conditionVal);
+        return true;
+    }
+
+    const char *condition = JS_ToCString(ctx, conditionVal);
+    JS_FreeValue(ctx, conditionVal);
+    if (!condition) {
+        return false;
+    }
+
+    *conditionOut = trimDebuggerCommand(condition);
+    JS_FreeCString(ctx, condition);
+    return true;
+}
+
 static JSValue js_gxDebuggerSetBreakpoint(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
 {
     if (argc < 2) {
-        return JS_ThrowTypeError(ctx, "setBreakpoint(file, line) expects 2 arguments");
+        return JS_ThrowTypeError(ctx, "setBreakpoint(file, line[, options]) expects at least 2 arguments");
     }
 
     GxQjsDebuggerState *state = getDebuggerState(ctx);
@@ -197,7 +238,13 @@ static JSValue js_gxDebuggerSetBreakpoint(JSContext *ctx, JSValueConst, int argc
         return JS_ThrowRangeError(ctx, "breakpoint line must be positive");
     }
 
-    state->breakpoints.emplace(resolvedFile, line);
+    std::string condition;
+    if (!readBreakpointConditionOption(ctx, argc, argv, &condition)) {
+        JS_FreeCString(ctx, file);
+        return JS_EXCEPTION;
+    }
+
+    state->breakpoints[{resolvedFile, line}] = GxDebuggerBreakpoint{condition};
     state->suppressedBreakpoints.clear();
     updateDebuggerHandler(ctx, state);
     JS_FreeCString(ctx, file);
@@ -276,6 +323,7 @@ static JSValue js_gxDebuggerListBreakpoints(JSContext *ctx, JSValueConst, int, J
         if (JS_SetPropertyStr(ctx, item, "id", JS_NewInt32(ctx, static_cast<int32_t>(breakpoint.id))) < 0
             || JS_SetPropertyStr(ctx, item, "file", JS_NewString(ctx, breakpoint.file.c_str())) < 0
             || JS_SetPropertyStr(ctx, item, "line", JS_NewInt32(ctx, breakpoint.line)) < 0
+            || JS_SetPropertyStr(ctx, item, "condition", JS_NewString(ctx, breakpoint.condition.c_str())) < 0
             || JS_SetPropertyUint32(ctx, list, i, item) < 0) {
             JS_FreeValue(ctx, item);
             JS_FreeValue(ctx, list);
@@ -296,6 +344,7 @@ static JSValue js_gxDebuggerPause(JSContext *ctx, JSValueConst, int, JSValueCons
     state->pauseRequested = true;
     state->resumeRequested = false;
     state->stepKind = GxDebuggerStepKind::None;
+    state->stepSkipCurrentLocation = false;
     state->stepOrigin = {};
     updateDebuggerHandler(ctx, state);
     return JS_UNDEFINED;
@@ -311,6 +360,7 @@ static JSValue js_gxDebuggerResume(JSContext *ctx, JSValueConst, int, JSValueCon
     state->pauseRequested = false;
     state->resumeRequested = true;
     state->stepKind = GxDebuggerStepKind::None;
+    state->stepSkipCurrentLocation = false;
     state->stepOrigin = {};
     updateDebuggerHandler(ctx, state);
     return JS_UNDEFINED;
@@ -321,6 +371,7 @@ static void requestDebuggerStep(GxQjsDebuggerState *state, GxDebuggerStepKind ki
     state->pauseRequested = false;
     state->resumeRequested = true;
     state->stepKind = kind;
+    state->stepSkipCurrentLocation = false;
     state->stepOrigin = {};
 }
 
@@ -495,14 +546,113 @@ static bool isBreakpointFileMatch(const std::string &breakpointFile, const std::
     return false;
 }
 
-static bool hasBreakpointAt(const GxQjsDebuggerState *state, const std::string &file, int lineNum)
+static bool readSourceLine(const std::string &file, int lineNum, std::string *lineOut)
 {
-    for (const auto &breakpoint: state->breakpoints) {
-        if (breakpoint.second == lineNum && isBreakpointFileMatch(breakpoint.first, file)) {
+    if (!lineOut || lineNum <= 0) {
+        return false;
+    }
+
+    std::ifstream input(file);
+    if (!input.is_open()) {
+        return false;
+    }
+
+    std::string line;
+    for (int currentLine = 1; std::getline(input, line); ++currentLine) {
+        if (currentLine == lineNum) {
+            *lineOut = line;
             return true;
         }
     }
     return false;
+}
+
+static std::string trimSourceLine(const std::string &line)
+{
+    size_t begin = 0;
+    while (begin < line.size() && std::isspace(static_cast<unsigned char>(line[begin]))) {
+        ++begin;
+    }
+
+    size_t end = line.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(line[end - 1]))) {
+        --end;
+    }
+    return line.substr(begin, end - begin);
+}
+
+static bool isDebuggerSignificantSourceLine(const std::string &line)
+{
+    const std::string trimmed = trimSourceLine(line);
+    if (trimmed.empty()) {
+        return false;
+    }
+    return trimmed.rfind("//", 0) != 0 && trimmed.rfind("/*", 0) != 0 && trimmed.rfind("*", 0) != 0;
+}
+
+static bool isDebuggerControlHeadSourceLine(const std::string &line)
+{
+    const std::string trimmed = trimSourceLine(line);
+    const auto startsWithKeyword = [&trimmed](const char *keyword) {
+        const size_t len = std::strlen(keyword);
+        return trimmed.size() >= len && trimmed.compare(0, len, keyword) == 0
+               && (trimmed.size() == len || !std::isalnum(static_cast<unsigned char>(trimmed[len])));
+    };
+    return startsWithKeyword("if") || startsWithKeyword("for") || startsWithKeyword("while")
+           || startsWithKeyword("switch") || startsWithKeyword("try") || startsWithKeyword("catch");
+}
+
+static bool canMatchBreakpointAtPreviousSourceLine(const std::string &runtimeFile, int runtimeLine, int breakpointLine)
+{
+    const int distance = breakpointLine - runtimeLine;
+    if (distance <= 0 || distance > 5) {
+        return false;
+    }
+
+    std::string requestedLine;
+    if (!readSourceLine(runtimeFile, breakpointLine, &requestedLine)
+        || !isDebuggerSignificantSourceLine(requestedLine)) {
+        return false;
+    }
+
+    for (int line = breakpointLine - 1; line > 0; --line) {
+        std::string sourceLine;
+        if (!readSourceLine(runtimeFile, line, &sourceLine)) {
+            return false;
+        }
+        if (!isDebuggerSignificantSourceLine(sourceLine)) {
+            continue;
+        }
+        return line == runtimeLine && !isDebuggerControlHeadSourceLine(sourceLine);
+    }
+    return false;
+}
+
+static const GxDebuggerBreakpoint *findBreakpointAt(const GxQjsDebuggerState *state, const std::string &file, int lineNum)
+{
+    for (const auto &breakpoint: state->breakpoints) {
+        if (breakpoint.first.second == lineNum && isBreakpointFileMatch(breakpoint.first.first, file)) {
+            return &breakpoint.second;
+        }
+    }
+
+    const GxDebuggerBreakpoint *nearestBreakpoint = nullptr;
+    int nearestDistance = 0;
+    for (const auto &breakpoint: state->breakpoints) {
+        if (!isBreakpointFileMatch(breakpoint.first.first, file)) {
+            continue;
+        }
+
+        if (!canMatchBreakpointAtPreviousSourceLine(file, lineNum, breakpoint.first.second)) {
+            continue;
+        }
+        const int distance = breakpoint.first.second - lineNum;
+        if (!nearestBreakpoint || distance < nearestDistance) {
+            nearestBreakpoint = &breakpoint.second;
+            nearestDistance = distance;
+        }
+    }
+    return nearestBreakpoint;
 }
 
 static std::vector<GxDebuggerBreakpointView> collectBreakpointViews(const GxQjsDebuggerState *state)
@@ -515,7 +665,7 @@ static std::vector<GxDebuggerBreakpointView> collectBreakpointViews(const GxQjsD
     breakpoints.reserve(state->breakpoints.size());
     size_t id = 1;
     for (const auto &breakpoint: state->breakpoints) {
-        breakpoints.push_back({id++, breakpoint.first, breakpoint.second});
+        breakpoints.push_back({id++, breakpoint.first.first, breakpoint.first.second, breakpoint.second.condition});
     }
     return breakpoints;
 }
@@ -570,6 +720,26 @@ static bool parseBreakpointSpec(JSContext *ctx, const std::string &spec, const s
     return true;
 }
 
+static bool splitBreakpointCondition(const std::string &spec, std::string *locationOut, std::string *conditionOut)
+{
+    if (!locationOut || !conditionOut) {
+        return false;
+    }
+
+    const std::string trimmed = trimDebuggerCommand(spec);
+    const std::string marker = " if ";
+    const size_t markerPos = trimmed.find(marker);
+    if (markerPos == std::string::npos) {
+        *locationOut = trimmed;
+        conditionOut->clear();
+        return true;
+    }
+
+    *locationOut = trimDebuggerCommand(trimmed.substr(0, markerPos));
+    *conditionOut = trimDebuggerCommand(trimmed.substr(markerPos + marker.size()));
+    return !locationOut->empty() && !conditionOut->empty();
+}
+
 static bool removeBreakpointBySpec(JSContext *ctx, GxQjsDebuggerState *state, const std::string &spec,
                                    const std::string *currentFile)
 {
@@ -604,7 +774,11 @@ static void printBreakpointList(const GxQjsDebuggerState *state)
 
     std::fprintf(stderr, "[GxDebugger] breakpoints:\n");
     for (const auto &breakpoint: breakpoints) {
-        std::fprintf(stderr, "  #%zu %s:%d\n", breakpoint.id, breakpoint.file.c_str(), breakpoint.line);
+        std::fprintf(stderr, "  #%zu %s:%d", breakpoint.id, breakpoint.file.c_str(), breakpoint.line);
+        if (!breakpoint.condition.empty()) {
+            std::fprintf(stderr, " if %s", breakpoint.condition.c_str());
+        }
+        std::fprintf(stderr, "\n");
     }
 }
 
@@ -646,6 +820,19 @@ static void printWatchException(JSContext *ctx, const std::string &expr)
     JS_FreeValue(ctx, exceptionVal);
 }
 
+static void printBreakpointConditionException(JSContext *ctx, const std::string &condition)
+{
+    const JSValue exceptionVal = JS_GetException(ctx);
+    const char *exceptionStr = JS_ToCString(ctx, exceptionVal);
+    std::fprintf(stderr, "[GxDebugger] breakpoint condition %s = <exception", condition.c_str());
+    if (exceptionStr) {
+        std::fprintf(stderr, ": %s", exceptionStr);
+        JS_FreeCString(ctx, exceptionStr);
+    }
+    std::fprintf(stderr, ">\n");
+    JS_FreeValue(ctx, exceptionVal);
+}
+
 static void beginWatchEvaluation(JSContext *ctx, GxQjsDebuggerState *state)
 {
     state->evaluatingWatches = true;
@@ -658,16 +845,16 @@ static void endWatchEvaluation(JSContext *ctx, GxQjsDebuggerState *state)
     updateDebuggerHandler(ctx, state);
 }
 
-static void printWatchValue(JSContext *ctx, GxQjsDebuggerState *state, JSValueConst locals, const std::string &expr)
+static JSValue evalExpressionWithLocals(JSContext *ctx, GxQjsDebuggerState *state, JSValueConst locals,
+                                        const std::string &expr, const char *filename)
 {
     const std::string source = "(function(__gx_locals){ with (__gx_locals) { return (" + expr + "); } })";
 
     beginWatchEvaluation(ctx, state);
-    JSValue funcVal = JS_Eval(ctx, source.c_str(), source.size(), "<gx-watch>", JS_EVAL_TYPE_GLOBAL);
+    JSValue funcVal = JS_Eval(ctx, source.c_str(), source.size(), filename, JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(funcVal)) {
         endWatchEvaluation(ctx, state);
-        printWatchException(ctx, expr);
-        return;
+        return JS_EXCEPTION;
     }
 
     JSValue argv[] = { JS_DupValue(ctx, locals) };
@@ -675,7 +862,12 @@ static void printWatchValue(JSContext *ctx, GxQjsDebuggerState *state, JSValueCo
     JS_FreeValue(ctx, argv[0]);
     JS_FreeValue(ctx, funcVal);
     endWatchEvaluation(ctx, state);
+    return resultVal;
+}
 
+static void printWatchValue(JSContext *ctx, GxQjsDebuggerState *state, JSValueConst locals, const std::string &expr)
+{
+    JSValue resultVal = evalExpressionWithLocals(ctx, state, locals, expr, "<gx-watch>");
     if (JS_IsException(resultVal)) {
         printWatchException(ctx, expr);
         return;
@@ -690,6 +882,39 @@ static void printWatchValue(JSContext *ctx, GxQjsDebuggerState *state, JSValueCo
         std::fprintf(stderr, "[GxDebugger] watch %s = <unprintable>\n", expr.c_str());
     }
     JS_FreeValue(ctx, resultVal);
+}
+
+static bool shouldPauseForBreakpointCondition(JSContext *ctx, GxQjsDebuggerState *state,
+                                              const GxDebuggerBreakpoint *breakpoint,
+                                              JSDebuggerLocalsGetter *getLocals, void *getLocalsOpaque)
+{
+    if (!breakpoint || breakpoint->condition.empty()) {
+        return true;
+    }
+
+    JSValue locals = getLocals(ctx, getLocalsOpaque);
+    if (JS_IsException(locals)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        std::fprintf(stderr, "[GxDebugger] failed to collect locals for breakpoint condition\n");
+        return true;
+    }
+
+    JSValue resultVal = evalExpressionWithLocals(ctx, state, locals, breakpoint->condition, "<gx-breakpoint-condition>");
+    JS_FreeValue(ctx, locals);
+    if (JS_IsException(resultVal)) {
+        printBreakpointConditionException(ctx, breakpoint->condition);
+        return true;
+    }
+
+    const int result = JS_ToBool(ctx, resultVal);
+    JS_FreeValue(ctx, resultVal);
+    if (result < 0) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        std::fprintf(stderr, "[GxDebugger] failed to convert breakpoint condition to boolean: %s\n",
+                     breakpoint->condition.c_str());
+        return true;
+    }
+    return result == 1;
 }
 
 static void printWatches(JSContext *ctx, GxQjsDebuggerState *state, JSValueConst locals)
@@ -751,7 +976,7 @@ static const char *stepKindName(GxDebuggerStepKind kind)
 }
 
 static GxDebuggerLocation makeDebuggerLocation(const std::string &file, int lineNum, int colNum,
-                                               uint64_t frameId, uint32_t frameDepth)
+                                               uint64_t frameId, uint32_t frameDepth, uint32_t pcOffset)
 {
     GxDebuggerLocation location;
     location.valid = true;
@@ -760,16 +985,17 @@ static GxDebuggerLocation makeDebuggerLocation(const std::string &file, int line
     location.col = colNum;
     location.frameId = frameId;
     location.frameDepth = frameDepth;
+    location.pcOffset = pcOffset;
     return location;
 }
 
 static bool sameDebuggerLocation(const GxDebuggerLocation &lhs, const GxDebuggerLocation &rhs)
 {
     return lhs.valid && rhs.valid && lhs.frameId == rhs.frameId && lhs.file == rhs.file
-           && lhs.line == rhs.line && lhs.col == rhs.col;
+           && lhs.line == rhs.line && lhs.col == rhs.col && lhs.pcOffset == rhs.pcOffset;
 }
 
-static bool shouldStopForStep(const GxQjsDebuggerState *state, const GxDebuggerLocation &current)
+static bool shouldStopForStep(GxQjsDebuggerState *state, const GxDebuggerLocation &current)
 {
     if (state->stepKind == GxDebuggerStepKind::None || !current.valid) {
         return false;
@@ -777,16 +1003,19 @@ static bool shouldStopForStep(const GxQjsDebuggerState *state, const GxDebuggerL
     if (!state->stepOrigin.valid) {
         return true;
     }
+    if (state->stepSkipCurrentLocation && sameDebuggerLocation(current, state->stepOrigin)) {
+        state->stepSkipCurrentLocation = false;
+        return false;
+    }
 
     switch (state->stepKind) {
     case GxDebuggerStepKind::Into:
-        return !sameDebuggerLocation(current, state->stepOrigin);
+        return true;
     case GxDebuggerStepKind::Over:
         if (current.frameDepth > state->stepOrigin.frameDepth) {
             return false;
         }
-        return current.frameDepth < state->stepOrigin.frameDepth
-               || !sameDebuggerLocation(current, state->stepOrigin);
+        return true;
     case GxDebuggerStepKind::Out:
         return current.frameDepth < state->stepOrigin.frameDepth;
     case GxDebuggerStepKind::None:
@@ -801,6 +1030,7 @@ static void requestDebuggerStepFromLocation(GxQjsDebuggerState *state, GxDebugge
     state->pauseRequested = false;
     state->resumeRequested = true;
     state->stepKind = kind;
+    state->stepSkipCurrentLocation = true;
     state->stepOrigin = origin;
     std::fprintf(stderr, "[GxDebugger] %s\n", stepKindName(kind));
 }
@@ -808,6 +1038,7 @@ static void requestDebuggerStepFromLocation(GxQjsDebuggerState *state, GxDebugge
 static void clearDebuggerStep(GxQjsDebuggerState *state)
 {
     state->stepKind = GxDebuggerStepKind::None;
+    state->stepSkipCurrentLocation = false;
     state->stepOrigin = {};
 }
 
@@ -929,6 +1160,7 @@ static void printInteractiveHelp()
                  "    lb, bl, breakpoints       List breakpoints with numeric ids.\n"
                  "    info breakpoints          List breakpoints, GDB-style alias.\n"
                  "    b <file>:<line>           Add a breakpoint. Use . for the current paused file.\n"
+                 "    b <file>:<line> if <expr> Add a conditional breakpoint.\n"
                  "    break <file>:<line>       Add a breakpoint, long form.\n"
                  "    d <id>                    Delete a breakpoint by id from lb.\n"
                  "    d <file>:<line>           Delete a breakpoint by location. . is supported.\n"
@@ -936,6 +1168,7 @@ static void printInteractiveHelp()
                  "\n"
                  "  Examples:\n"
                  "    b .:42                    Break at line 42 in the current file.\n"
+                 "    b .:42 if a > 10          Break only when the condition is truthy.\n"
                  "    b examples/js/test.js:27  Break at a path suffix or full path.\n"
                  "    locals                    Print visible variables at the current stop.\n"
                  "    p self.a + b              Print an expression using current locals.\n"
@@ -998,12 +1231,15 @@ static bool runInteractiveDebugger(JSContext *ctx, GxQjsDebuggerState *state,
         if (command.rfind("b ", 0) == 0 || command.rfind("break ", 0) == 0) {
             const size_t offset = command[0] == 'b' ? 2 : 6;
             const std::string spec = trimDebuggerCommand(command.substr(offset));
+            std::string location;
+            std::string condition;
             std::string file;
             int line = 0;
-            if (!parseBreakpointSpec(ctx, spec, &current.file, &file, &line)) {
-                std::fprintf(stderr, "[GxDebugger] breakpoint expects <file>:<line>\n");
+            if (!splitBreakpointCondition(spec, &location, &condition)
+                || !parseBreakpointSpec(ctx, location, &current.file, &file, &line)) {
+                std::fprintf(stderr, "[GxDebugger] breakpoint expects <file>:<line> [if <expr>]\n");
             } else {
-                state->breakpoints.emplace(file, line);
+                state->breakpoints[{file, line}] = GxDebuggerBreakpoint{condition};
                 state->suppressedBreakpoints.clear();
                 updateDebuggerHandler(ctx, state);
                 size_t breakpointId = 0;
@@ -1013,8 +1249,12 @@ static bool runInteractiveDebugger(JSContext *ctx, GxQjsDebuggerState *state,
                         break;
                     }
                 }
-                std::fprintf(stderr, "[GxDebugger] breakpoint added #%zu %s:%d\n",
+                std::fprintf(stderr, "[GxDebugger] breakpoint added #%zu %s:%d",
                              breakpointId, file.c_str(), line);
+                if (!condition.empty()) {
+                    std::fprintf(stderr, " if %s", condition.c_str());
+                }
+                std::fprintf(stderr, "\n");
             }
             continue;
         }
@@ -1072,8 +1312,8 @@ static bool runInteractiveDebugger(JSContext *ctx, GxQjsDebuggerState *state,
 }
 
 static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, int colNum,
-                             uint64_t frameId, uint32_t frameDepth, JSDebuggerLocalsGetter *getLocals,
-                             void *getLocalsOpaque, void *opaque)
+                             uint64_t frameId, uint32_t frameDepth, uint32_t pcOffset,
+                             JSDebuggerLocalsGetter *getLocals, void *getLocalsOpaque, void *opaque)
 {
     GxQjsDebuggerState *state = static_cast<GxQjsDebuggerState *>(opaque);
     if (!state || lineNum <= 0) {
@@ -1084,7 +1324,7 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
     }
 
     const std::string file = filename ? filename : "<anonymous>";
-    const GxDebuggerLocation current = makeDebuggerLocation(file, lineNum, colNum, frameId, frameDepth);
+    const GxDebuggerLocation current = makeDebuggerLocation(file, lineNum, colNum, frameId, frameDepth, pcOffset);
     auto suppressedIt = state->suppressedBreakpoints.find(frameId);
     if (suppressedIt != state->suppressedBreakpoints.end()
         && (suppressedIt->second.first != file || suppressedIt->second.second != lineNum)) {
@@ -1092,10 +1332,17 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
         suppressedIt = state->suppressedBreakpoints.end();
     }
 
-    const bool breakpointHit = hasBreakpointAt(state, file, lineNum);
     const bool suppressed = suppressedIt != state->suppressedBreakpoints.end();
     const bool pauseHit = state->pauseRequested;
     const bool stepHit = shouldStopForStep(state, current);
+    const GxDebuggerBreakpoint *breakpoint = findBreakpointAt(state, file, lineNum);
+    bool breakpointHit = breakpoint != nullptr;
+    if (breakpointHit && !suppressed && !pauseHit && !stepHit) {
+        breakpointHit = shouldPauseForBreakpointCondition(ctx, state, breakpoint, getLocals, getLocalsOpaque);
+        if (!breakpointHit) {
+            return 0;
+        }
+    }
     if (!pauseHit && !stepHit && (!breakpointHit || suppressed)) {
         return 0;
     }
@@ -1134,7 +1381,7 @@ static void installGxDebugger(JSContext *ctx, GxQjsDebuggerState *debuggerState)
 
     const JSValue debuggerObj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, debuggerObj, "setBreakpoint",
-                      JS_NewCFunction(ctx, js_gxDebuggerSetBreakpoint, "setBreakpoint", 2));
+                      JS_NewCFunction(ctx, js_gxDebuggerSetBreakpoint, "setBreakpoint", 3));
     JS_SetPropertyStr(ctx, debuggerObj, "clearBreakpoint",
                       JS_NewCFunction(ctx, js_gxDebuggerClearBreakpoint, "clearBreakpoint", 2));
     JS_SetPropertyStr(ctx, debuggerObj, "clearAllBreakpoints",

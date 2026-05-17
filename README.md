@@ -91,6 +91,7 @@ Breakpoints are set by source file and 1-based line number.
 ```js
 GxDebugger.setBreakpoint(".", 27);
 GxDebugger.setBreakpoint("examples/js/test.js", 44);
+GxDebugger.setBreakpoint(".", 52, { condition: "a > 10" });
 GxDebugger.clearBreakpoint(".", 27);
 GxDebugger.clearAllBreakpoints();
 ```
@@ -102,10 +103,14 @@ The file argument may be an absolute path, a path suffix such as
 
 ```js
 [
-    { id: 1, file: "/path/to/test.js", line: 27 },
-    { id: 2, file: "examples/js/test.js", line: 44 }
+    { id: 1, file: "/path/to/test.js", line: 27, condition: "" },
+    { id: 2, file: "examples/js/test.js", line: 44, condition: "a > 10" }
 ]
 ```
+
+Conditional breakpoints evaluate `condition` in the current frame locals. A
+truthy result pauses execution. If condition evaluation throws, the debugger
+prints the exception and pauses instead of silently skipping the breakpoint.
 
 ### Pause And Step
 
@@ -159,6 +164,7 @@ w, watch, watches         Print all watch expressions.
 p <expr>, print <expr>    Evaluate one expression in current frame locals.
 lb, breakpoints           List breakpoints.
 b <file>:<line>           Add a breakpoint. Use . for the current file.
+b <file>:<line> if <expr> Add a conditional breakpoint.
 d <id|file:line>          Delete a breakpoint by id or location.
 q, quit                   Stop execution with a debugger error.
 ```
@@ -167,6 +173,7 @@ Examples:
 
 ```text
 b .:42
+b .:42 if a > 10
 b examples/js/test.js:27
 d 2
 locals

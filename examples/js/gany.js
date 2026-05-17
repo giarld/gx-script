@@ -351,9 +351,10 @@ const GxDebugger = {
      * 传入 `"."` 时表示当前执行中的源码文件。
      * @param {string} file - 脚本文件路径或路径后缀。
      * @param {number} line - 1-based 源码行号。
+     * @param {{condition?:string}=} options - 可选断点参数，`condition` 为 truthy 时才暂停。
      * @returns {void}
      */
-    setBreakpoint: function(file, line) {},
+    setBreakpoint: function(file, line, options) {},
 
     /**
      * 清除一个源码行断点。
@@ -375,7 +376,7 @@ const GxDebugger = {
      * 列出当前运行时中的全部断点。
      *
      * 返回值可直接用于断点面板渲染，每项包含 `id`、`file`、`line`。
-     * @returns {{id:number,file:string,line:number}[]} 当前断点列表。
+     * @returns {{id:number,file:string,line:number,condition:string}[]} 当前断点列表。
      */
     listBreakpoints: function() {},
 
@@ -424,7 +425,8 @@ const GxDebugger = {
      * 开启后，命中断点会阻塞当前 JS 线程并等待 stdin 命令：
      * `c/continue/resume` 继续，`s/step` 单步进入，`n/next` 单步越过，
      * `finish/out` 单步跳出，`bt` 打印堆栈，`b <file>:<line>` 增加断点，
-     * 其中 `<file>` 可用 `"."` 表示当前暂停文件；`d <id|file:line>` 删除断点，
+     * `b <file>:<line> if <expr>` 增加条件断点，其中 `<file>` 可用 `"."` 表示当前暂停文件；
+     * `d <id|file:line>` 删除断点，
      * `lb` 列出断点，`locals/vars/scope` 打印当前变量，`w` 打印 watches，
      * `p <expr>` 求值表达式。
      * @param {boolean} enabled - 是否进入交互模式。

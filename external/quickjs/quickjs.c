@@ -7702,7 +7702,13 @@ static JSValue js_debugger_get_locals(JSContext *ctx, void *opaque)
         for(i = 0; i < b->arg_count && i < sf->arg_count; i++) {
             JSAtom atom = b->vardefs[i].var_name;
             if (atom != JS_ATOM_NULL && !JS_IsUninitialized(sf->arg_buf[i])) {
-                if (JS_SetProperty(ctx, locals, atom, JS_DupValue(ctx, sf->arg_buf[i])) < 0) {
+                JSValueConst value = sf->arg_buf[i];
+                if (b->vardefs[i].is_captured) {
+                    JSVarRef *var_ref = sf->var_refs[b->vardefs[i].var_ref_idx];
+                    if (var_ref && var_ref->pvalue)
+                        value = *var_ref->pvalue;
+                }
+                if (JS_SetProperty(ctx, locals, atom, JS_DupValue(ctx, value)) < 0) {
                     JS_FreeValue(ctx, locals);
                     return JS_EXCEPTION;
                 }
@@ -7711,7 +7717,13 @@ static JSValue js_debugger_get_locals(JSContext *ctx, void *opaque)
         for(i = 0; i < b->var_count; i++) {
             JSAtom atom = b->vardefs[b->arg_count + i].var_name;
             if (atom != JS_ATOM_NULL && !JS_IsUninitialized(sf->var_buf[i])) {
-                if (JS_SetProperty(ctx, locals, atom, JS_DupValue(ctx, sf->var_buf[i])) < 0) {
+                JSValueConst value = sf->var_buf[i];
+                if (b->vardefs[b->arg_count + i].is_captured) {
+                    JSVarRef *var_ref = sf->var_refs[b->vardefs[b->arg_count + i].var_ref_idx];
+                    if (var_ref && var_ref->pvalue)
+                        value = *var_ref->pvalue;
+                }
+                if (JS_SetProperty(ctx, locals, atom, JS_DupValue(ctx, value)) < 0) {
                     JS_FreeValue(ctx, locals);
                     return JS_EXCEPTION;
                 }
@@ -7746,7 +7758,7 @@ static int js_debugger_poll(JSContext *ctx, JSFunctionBytecode *b, uint8_t *pc)
     locals_state.b = b;
     ret = rt->debugger_handler(ctx, filename ? filename : "<anonymous>",
                                line_num, col_num, sf->debugger_frame_id,
-                               frame_depth,
+                               frame_depth, pc_value,
                                js_debugger_get_locals, &locals_state,
                                rt->debugger_opaque);
     JS_FreeCString(ctx, filename);

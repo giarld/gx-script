@@ -1153,7 +1153,8 @@ JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, voi
 typedef JSValue JSDebuggerLocalsGetter(JSContext *ctx, void *opaque);
 typedef int JSDebuggerHandler(JSContext *ctx, const char *filename,
                               int line_num, int col_num, uint64_t frame_id,
-                              uint32_t frame_depth, JSDebuggerLocalsGetter *get_locals,
+                              uint32_t frame_depth, uint32_t pc_offset,
+                              JSDebuggerLocalsGetter *get_locals,
                               void *get_locals_opaque, void *opaque);
 JS_EXTERN void JS_SetDebuggerHandler(JSRuntime *rt, JSDebuggerHandler *cb, void *opaque);
 /* if can_block is true, Atomics.wait() can be used */
