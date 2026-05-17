@@ -348,6 +348,7 @@ const GxDebugger = {
      * 设置一个源码行断点。
      *
      * `file` 可以是绝对路径，也可以是文件尾部路径，例如 `"test.js"` 或 `"examples/js/test.js"`。
+     * 传入 `"."` 时表示当前执行中的源码文件。
      * @param {string} file - 脚本文件路径或路径后缀。
      * @param {number} line - 1-based 源码行号。
      * @returns {void}
@@ -356,6 +357,8 @@ const GxDebugger = {
 
     /**
      * 清除一个源码行断点。
+     *
+     * `file` 传入 `"."` 时表示当前执行中的源码文件。
      * @param {string} file - 脚本文件路径或路径后缀。
      * @param {number} line - 1-based 源码行号。
      * @returns {void}
@@ -369,10 +372,42 @@ const GxDebugger = {
     clearAllBreakpoints: function() {},
 
     /**
+     * 列出当前运行时中的全部断点。
+     *
+     * 返回值可直接用于断点面板渲染，每项包含 `id`、`file`、`line`。
+     * @returns {{id:number,file:string,line:number}[]} 当前断点列表。
+     */
+    listBreakpoints: function() {},
+
+    /**
      * 请求在下一次可停 JS 字节码位置暂停。
      * @returns {void}
      */
     pause: function() {},
+
+    /**
+     * 从 debugger 暂停状态继续执行。
+     * @returns {void}
+     */
+    resume: function() {},
+
+    /**
+     * 单步进入。若下一步是 JS 函数调用，会进入被调用函数内部。
+     * @returns {void}
+     */
+    stepInto: function() {},
+
+    /**
+     * 单步越过。若下一步是 JS 函数调用，会在当前栈帧继续到下一处源码位置。
+     * @returns {void}
+     */
+    stepOver: function() {},
+
+    /**
+     * 单步跳出当前 JS 函数，在调用方下一次可停位置暂停。
+     * @returns {void}
+     */
+    stepOut: function() {},
 
     /**
      * 设置断点命中时是否触发原生 SIGTRAP。
@@ -382,6 +417,20 @@ const GxDebugger = {
      * @returns {void}
      */
     setTrapOnBreak: function(enabled) {},
+
+    /**
+     * 设置断点命中时是否进入命令行交互模式。
+     *
+     * 开启后，命中断点会阻塞当前 JS 线程并等待 stdin 命令：
+     * `c/continue/resume` 继续，`s/step` 单步进入，`n/next` 单步越过，
+     * `finish/out` 单步跳出，`bt` 打印堆栈，`b <file>:<line>` 增加断点，
+     * 其中 `<file>` 可用 `"."` 表示当前暂停文件；`d <id|file:line>` 删除断点，
+     * `lb` 列出断点，`locals/vars/scope` 打印当前变量，`w` 打印 watches，
+     * `p <expr>` 求值表达式。
+     * @param {boolean} enabled - 是否进入交互模式。
+     * @returns {void}
+     */
+    setInteractiveOnBreak: function(enabled) {},
 
     /**
      * 设置断点命中时是否打印当前 JS 调用堆栈。

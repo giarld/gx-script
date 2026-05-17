@@ -23,6 +23,31 @@ namespace
 {
 constexpr const char *GAnyModulePrefix = "gany:";
 
+enum class GxDebuggerStepKind
+{
+    None,
+    Into,
+    Over,
+    Out,
+};
+
+struct GxDebuggerLocation
+{
+    bool valid = false;
+    std::string file;
+    int line = 0;
+    int col = 0;
+    uint64_t frameId = 0;
+    uint32_t frameDepth = 0;
+};
+
+struct GxDebuggerBreakpointView
+{
+    size_t id = 0;
+    std::string file;
+    int line = 0;
+};
+
 struct GAnyModuleExports
 {
     bool valid = false;
@@ -34,9 +59,13 @@ struct GxQjsDebuggerState
 {
     std::set<std::pair<std::string, int>> breakpoints;
     bool pauseRequested = false;
+    bool resumeRequested = false;
     bool trapOnBreak = true;
+    bool interactiveOnBreak = false;
     bool printStackOnBreak = true;
     bool evaluatingWatches = false;
+    GxDebuggerStepKind stepKind = GxDebuggerStepKind::None;
+    GxDebuggerLocation stepOrigin;
     std::vector<std::string> watches;
     std::map<uint64_t, std::pair<std::string, int>> suppressedBreakpoints;
 };
@@ -57,12 +86,20 @@ static GxQjsDebuggerState *getDebuggerState(JSContext *ctx)
 }
 
 static int gxQjsDebuggerPoll(JSContext *, const char *filename, int lineNum, int colNum,
-                             uint64_t frameId, JSDebuggerLocalsGetter *getLocals,
+                             uint64_t frameId, uint32_t frameDepth, JSDebuggerLocalsGetter *getLocals,
                              void *getLocalsOpaque, void *opaque);
+static std::string trimDebuggerCommand(const std::string &command);
+static std::vector<GxDebuggerBreakpointView> collectBreakpointViews(const GxQjsDebuggerState *state);
+static bool parseBreakpointSpec(JSContext *ctx, const std::string &spec, const std::string *currentFile,
+                                std::string *fileOut, int *lineOut);
+static bool removeBreakpointBySpec(JSContext *ctx, GxQjsDebuggerState *state, const std::string &spec,
+                                   const std::string *currentFile);
+static void printBreakpointList(const GxQjsDebuggerState *state);
 
 static void updateDebuggerHandler(JSContext *ctx, GxQjsDebuggerState *state)
 {
-    const bool active = state && (state->pauseRequested || !state->breakpoints.empty());
+    const bool active = state && (state->pauseRequested || state->stepKind != GxDebuggerStepKind::None
+                                  || !state->breakpoints.empty());
     JS_SetDebuggerHandler(JS_GetRuntime(ctx), active ? gxQjsDebuggerPoll : nullptr, active ? state : nullptr);
 }
 
@@ -70,6 +107,62 @@ static JSValue js_debugBreak(JSContext *, JSValueConst, int, JSValueConst *)
 {
     nativeDebugBreak();
     return JS_UNDEFINED;
+}
+
+static void flushDebuggerOutput()
+{
+    std::fflush(stdout);
+    std::fflush(stderr);
+}
+
+static bool getCurrentSourceFile(JSContext *ctx, std::string *fileOut)
+{
+    if (!ctx || !fileOut) {
+        return false;
+    }
+
+    for (int stackLevel = 0; stackLevel < 32; ++stackLevel) {
+        JSAtom atom = JS_GetScriptOrModuleName(ctx, stackLevel);
+        if (atom == JS_ATOM_NULL) {
+            continue;
+        }
+
+        const char *file = JS_AtomToCString(ctx, atom);
+        JS_FreeAtom(ctx, atom);
+        if (!file) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            continue;
+        }
+
+        *fileOut = file;
+        JS_FreeCString(ctx, file);
+        if (!fileOut->empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool resolveBreakpointFileToken(JSContext *ctx, const std::string &fileToken, const std::string *currentFile,
+                                       std::string *fileOut)
+{
+    if (!fileOut) {
+        return false;
+    }
+
+    const std::string trimmed = trimDebuggerCommand(fileToken);
+    if (trimmed.empty()) {
+        return false;
+    }
+    if (trimmed != ".") {
+        *fileOut = trimmed;
+        return true;
+    }
+    if (currentFile && !currentFile->empty()) {
+        *fileOut = *currentFile;
+        return true;
+    }
+    return getCurrentSourceFile(ctx, fileOut);
 }
 
 static JSValue js_gxDebuggerSetBreakpoint(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
@@ -88,6 +181,12 @@ static JSValue js_gxDebuggerSetBreakpoint(JSContext *ctx, JSValueConst, int argc
         return JS_EXCEPTION;
     }
 
+    std::string resolvedFile;
+    if (!resolveBreakpointFileToken(ctx, file, nullptr, &resolvedFile)) {
+        JS_FreeCString(ctx, file);
+        return JS_ThrowReferenceError(ctx, "could not resolve current source file for breakpoint");
+    }
+
     int32_t line = 0;
     if (JS_ToInt32(ctx, &line, argv[1]) < 0) {
         JS_FreeCString(ctx, file);
@@ -98,7 +197,7 @@ static JSValue js_gxDebuggerSetBreakpoint(JSContext *ctx, JSValueConst, int argc
         return JS_ThrowRangeError(ctx, "breakpoint line must be positive");
     }
 
-    state->breakpoints.emplace(file, line);
+    state->breakpoints.emplace(resolvedFile, line);
     state->suppressedBreakpoints.clear();
     updateDebuggerHandler(ctx, state);
     JS_FreeCString(ctx, file);
@@ -121,13 +220,19 @@ static JSValue js_gxDebuggerClearBreakpoint(JSContext *ctx, JSValueConst, int ar
         return JS_EXCEPTION;
     }
 
+    std::string resolvedFile;
+    if (!resolveBreakpointFileToken(ctx, file, nullptr, &resolvedFile)) {
+        JS_FreeCString(ctx, file);
+        return JS_ThrowReferenceError(ctx, "could not resolve current source file for breakpoint");
+    }
+
     int32_t line = 0;
     if (JS_ToInt32(ctx, &line, argv[1]) < 0) {
         JS_FreeCString(ctx, file);
         return JS_EXCEPTION;
     }
 
-    state->breakpoints.erase({file, line});
+    state->breakpoints.erase({resolvedFile, line});
     state->suppressedBreakpoints.clear();
     updateDebuggerHandler(ctx, state);
     JS_FreeCString(ctx, file);
@@ -147,6 +252,40 @@ static JSValue js_gxDebuggerClearAllBreakpoints(JSContext *ctx, JSValueConst, in
     return JS_UNDEFINED;
 }
 
+static JSValue js_gxDebuggerListBreakpoints(JSContext *ctx, JSValueConst, int, JSValueConst *)
+{
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+
+    const auto breakpoints = collectBreakpointViews(state);
+    JSValue list = JS_NewArray(ctx);
+    if (JS_IsException(list)) {
+        return JS_EXCEPTION;
+    }
+
+    for (uint32_t i = 0; i < breakpoints.size(); ++i) {
+        const auto &breakpoint = breakpoints[i];
+        JSValue item = JS_NewObject(ctx);
+        if (JS_IsException(item)) {
+            JS_FreeValue(ctx, list);
+            return JS_EXCEPTION;
+        }
+
+        if (JS_SetPropertyStr(ctx, item, "id", JS_NewInt32(ctx, static_cast<int32_t>(breakpoint.id))) < 0
+            || JS_SetPropertyStr(ctx, item, "file", JS_NewString(ctx, breakpoint.file.c_str())) < 0
+            || JS_SetPropertyStr(ctx, item, "line", JS_NewInt32(ctx, breakpoint.line)) < 0
+            || JS_SetPropertyUint32(ctx, list, i, item) < 0) {
+            JS_FreeValue(ctx, item);
+            JS_FreeValue(ctx, list);
+            return JS_EXCEPTION;
+        }
+    }
+
+    return list;
+}
+
 static JSValue js_gxDebuggerPause(JSContext *ctx, JSValueConst, int, JSValueConst *)
 {
     GxQjsDebuggerState *state = getDebuggerState(ctx);
@@ -155,6 +294,68 @@ static JSValue js_gxDebuggerPause(JSContext *ctx, JSValueConst, int, JSValueCons
     }
 
     state->pauseRequested = true;
+    state->resumeRequested = false;
+    state->stepKind = GxDebuggerStepKind::None;
+    state->stepOrigin = {};
+    updateDebuggerHandler(ctx, state);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_gxDebuggerResume(JSContext *ctx, JSValueConst, int, JSValueConst *)
+{
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+
+    state->pauseRequested = false;
+    state->resumeRequested = true;
+    state->stepKind = GxDebuggerStepKind::None;
+    state->stepOrigin = {};
+    updateDebuggerHandler(ctx, state);
+    return JS_UNDEFINED;
+}
+
+static void requestDebuggerStep(GxQjsDebuggerState *state, GxDebuggerStepKind kind)
+{
+    state->pauseRequested = false;
+    state->resumeRequested = true;
+    state->stepKind = kind;
+    state->stepOrigin = {};
+}
+
+static JSValue js_gxDebuggerStepInto(JSContext *ctx, JSValueConst, int, JSValueConst *)
+{
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+
+    requestDebuggerStep(state, GxDebuggerStepKind::Into);
+    updateDebuggerHandler(ctx, state);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_gxDebuggerStepOver(JSContext *ctx, JSValueConst, int, JSValueConst *)
+{
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+
+    requestDebuggerStep(state, GxDebuggerStepKind::Over);
+    updateDebuggerHandler(ctx, state);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_gxDebuggerStepOut(JSContext *ctx, JSValueConst, int, JSValueConst *)
+{
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+
+    requestDebuggerStep(state, GxDebuggerStepKind::Out);
     updateDebuggerHandler(ctx, state);
     return JS_UNDEFINED;
 }
@@ -177,6 +378,27 @@ static JSValue js_gxDebuggerSetTrapOnBreak(JSContext *ctx, JSValueConst, int arg
     }
 
     state->trapOnBreak = enabled == 1;
+    return JS_UNDEFINED;
+}
+
+static JSValue js_gxDebuggerSetInteractiveOnBreak(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
+{
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+
+    if (argc == 0) {
+        state->interactiveOnBreak = true;
+        return JS_UNDEFINED;
+    }
+
+    const int enabled = JS_ToBool(ctx, argv[0]);
+    if (enabled < 0) {
+        return JS_EXCEPTION;
+    }
+
+    state->interactiveOnBreak = enabled == 1;
     return JS_UNDEFINED;
 }
 
@@ -283,6 +505,109 @@ static bool hasBreakpointAt(const GxQjsDebuggerState *state, const std::string &
     return false;
 }
 
+static std::vector<GxDebuggerBreakpointView> collectBreakpointViews(const GxQjsDebuggerState *state)
+{
+    std::vector<GxDebuggerBreakpointView> breakpoints;
+    if (!state) {
+        return breakpoints;
+    }
+
+    breakpoints.reserve(state->breakpoints.size());
+    size_t id = 1;
+    for (const auto &breakpoint: state->breakpoints) {
+        breakpoints.push_back({id++, breakpoint.first, breakpoint.second});
+    }
+    return breakpoints;
+}
+
+static bool parseBreakpointLine(const std::string &text, int *lineOut)
+{
+    if (!lineOut || text.empty()) {
+        return false;
+    }
+
+    int line = 0;
+    for (char ch: text) {
+        if (!std::isdigit(static_cast<unsigned char>(ch))) {
+            return false;
+        }
+        line = line * 10 + (ch - '0');
+    }
+    if (line <= 0) {
+        return false;
+    }
+
+    *lineOut = line;
+    return true;
+}
+
+static bool parseBreakpointSpec(JSContext *ctx, const std::string &spec, const std::string *currentFile,
+                                std::string *fileOut, int *lineOut)
+{
+    if (!fileOut || !lineOut) {
+        return false;
+    }
+
+    const std::string trimmed = trimDebuggerCommand(spec);
+    if (trimmed.empty()) {
+        return false;
+    }
+
+    const size_t colon = trimmed.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= trimmed.size()) {
+        return false;
+    }
+
+    int line = 0;
+    if (!parseBreakpointLine(trimmed.substr(colon + 1), &line)) {
+        return false;
+    }
+
+    if (!resolveBreakpointFileToken(ctx, trimmed.substr(0, colon), currentFile, fileOut)) {
+        return false;
+    }
+    *lineOut = line;
+    return true;
+}
+
+static bool removeBreakpointBySpec(JSContext *ctx, GxQjsDebuggerState *state, const std::string &spec,
+                                   const std::string *currentFile)
+{
+    if (!state) {
+        return false;
+    }
+
+    int id = 0;
+    if (parseBreakpointLine(spec, &id)) {
+        const auto breakpoints = collectBreakpointViews(state);
+        if (id >= 1 && static_cast<size_t>(id) <= breakpoints.size()) {
+            const auto &breakpoint = breakpoints[static_cast<size_t>(id) - 1];
+            return state->breakpoints.erase({breakpoint.file, breakpoint.line}) > 0;
+        }
+    }
+
+    std::string file;
+    int line = 0;
+    if (!parseBreakpointSpec(ctx, spec, currentFile, &file, &line)) {
+        return false;
+    }
+    return state->breakpoints.erase({file, line}) > 0;
+}
+
+static void printBreakpointList(const GxQjsDebuggerState *state)
+{
+    const auto breakpoints = collectBreakpointViews(state);
+    if (breakpoints.empty()) {
+        std::fprintf(stderr, "[GxDebugger] no breakpoints\n");
+        return;
+    }
+
+    std::fprintf(stderr, "[GxDebugger] breakpoints:\n");
+    for (const auto &breakpoint: breakpoints) {
+        std::fprintf(stderr, "  #%zu %s:%d\n", breakpoint.id, breakpoint.file.c_str(), breakpoint.line);
+    }
+}
+
 static void printCurrentJsStack(JSContext *ctx)
 {
     JSValue errorVal = JS_NewError(ctx);
@@ -374,8 +699,380 @@ static void printWatches(JSContext *ctx, GxQjsDebuggerState *state, JSValueConst
     }
 }
 
+static std::string trimDebuggerCommand(const std::string &command)
+{
+    const size_t begin = command.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        return {};
+    }
+    const size_t end = command.find_last_not_of(" \t\r\n");
+    return command.substr(begin, end - begin + 1);
+}
+
+static std::string escapeDebuggerSingleLine(const char *text)
+{
+    if (!text) {
+        return {};
+    }
+
+    std::string escaped;
+    for (const char *p = text; *p; ++p) {
+        switch (*p) {
+        case '\n':
+            escaped += "\\n";
+            break;
+        case '\r':
+            escaped += "\\r";
+            break;
+        case '\t':
+            escaped += "\\t";
+            break;
+        default:
+            escaped += *p;
+            break;
+        }
+    }
+    return escaped;
+}
+
+static const char *stepKindName(GxDebuggerStepKind kind)
+{
+    switch (kind) {
+    case GxDebuggerStepKind::Into:
+        return "step";
+    case GxDebuggerStepKind::Over:
+        return "next";
+    case GxDebuggerStepKind::Out:
+        return "finish";
+    case GxDebuggerStepKind::None:
+        break;
+    }
+    return "none";
+}
+
+static GxDebuggerLocation makeDebuggerLocation(const std::string &file, int lineNum, int colNum,
+                                               uint64_t frameId, uint32_t frameDepth)
+{
+    GxDebuggerLocation location;
+    location.valid = true;
+    location.file = file;
+    location.line = lineNum;
+    location.col = colNum;
+    location.frameId = frameId;
+    location.frameDepth = frameDepth;
+    return location;
+}
+
+static bool sameDebuggerLocation(const GxDebuggerLocation &lhs, const GxDebuggerLocation &rhs)
+{
+    return lhs.valid && rhs.valid && lhs.frameId == rhs.frameId && lhs.file == rhs.file
+           && lhs.line == rhs.line && lhs.col == rhs.col;
+}
+
+static bool shouldStopForStep(const GxQjsDebuggerState *state, const GxDebuggerLocation &current)
+{
+    if (state->stepKind == GxDebuggerStepKind::None || !current.valid) {
+        return false;
+    }
+    if (!state->stepOrigin.valid) {
+        return true;
+    }
+
+    switch (state->stepKind) {
+    case GxDebuggerStepKind::Into:
+        return !sameDebuggerLocation(current, state->stepOrigin);
+    case GxDebuggerStepKind::Over:
+        if (current.frameDepth > state->stepOrigin.frameDepth) {
+            return false;
+        }
+        return current.frameDepth < state->stepOrigin.frameDepth
+               || !sameDebuggerLocation(current, state->stepOrigin);
+    case GxDebuggerStepKind::Out:
+        return current.frameDepth < state->stepOrigin.frameDepth;
+    case GxDebuggerStepKind::None:
+        break;
+    }
+    return false;
+}
+
+static void requestDebuggerStepFromLocation(GxQjsDebuggerState *state, GxDebuggerStepKind kind,
+                                            const GxDebuggerLocation &origin)
+{
+    state->pauseRequested = false;
+    state->resumeRequested = true;
+    state->stepKind = kind;
+    state->stepOrigin = origin;
+    std::fprintf(stderr, "[GxDebugger] %s\n", stepKindName(kind));
+}
+
+static void clearDebuggerStep(GxQjsDebuggerState *state)
+{
+    state->stepKind = GxDebuggerStepKind::None;
+    state->stepOrigin = {};
+}
+
+static bool printWatchesWithLazyLocals(JSContext *ctx, GxQjsDebuggerState *state,
+                                       JSDebuggerLocalsGetter *getLocals, void *getLocalsOpaque)
+{
+    if (state->watches.empty()) {
+        return true;
+    }
+
+    JSValue locals = getLocals(ctx, getLocalsOpaque);
+    if (JS_IsException(locals)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        std::fprintf(stderr, "[GxDebugger] failed to collect locals for watches\n");
+        return false;
+    }
+
+    printWatches(ctx, state, locals);
+    JS_FreeValue(ctx, locals);
+    return true;
+}
+
+static void printExpressionWithLazyLocals(JSContext *ctx, GxQjsDebuggerState *state,
+                                          JSDebuggerLocalsGetter *getLocals, void *getLocalsOpaque,
+                                          const std::string &expr)
+{
+    JSValue locals = getLocals(ctx, getLocalsOpaque);
+    if (JS_IsException(locals)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        std::fprintf(stderr, "[GxDebugger] failed to collect locals for expression\n");
+        return;
+    }
+
+    printWatchValue(ctx, state, locals, expr);
+    JS_FreeValue(ctx, locals);
+}
+
+static void printLocals(JSContext *ctx, JSValueConst locals)
+{
+    JSPropertyEnum *props = nullptr;
+    uint32_t length = 0;
+    if (JS_GetOwnPropertyNames(ctx, &props, &length, locals, JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        std::fprintf(stderr, "[GxDebugger] failed to enumerate locals\n");
+        return;
+    }
+
+    if (length == 0) {
+        std::fprintf(stderr, "[GxDebugger] locals: <empty>\n");
+        JS_FreePropertyEnum(ctx, props, length);
+        return;
+    }
+
+    std::fprintf(stderr, "[GxDebugger] locals:\n");
+    for (uint32_t i = 0; i < length; ++i) {
+        const char *name = JS_AtomToCString(ctx, props[i].atom);
+        if (!name) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            continue;
+        }
+
+        JSValue value = JS_GetProperty(ctx, locals, props[i].atom);
+        if (JS_IsException(value)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            std::fprintf(stderr, "  %s = <exception>\n", name);
+            JS_FreeCString(ctx, name);
+            continue;
+        }
+
+        const char *valueStr = JS_ToCString(ctx, value);
+        if (valueStr) {
+            const std::string valueLine = escapeDebuggerSingleLine(valueStr);
+            std::fprintf(stderr, "  %s = %s\n", name, valueLine.empty() ? "\"\"" : valueLine.c_str());
+            JS_FreeCString(ctx, valueStr);
+        } else {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            std::fprintf(stderr, "  %s = <unprintable>\n", name);
+        }
+
+        JS_FreeValue(ctx, value);
+        JS_FreeCString(ctx, name);
+    }
+
+    JS_FreePropertyEnum(ctx, props, length);
+}
+
+static void printLocalsWithLazyLocals(JSContext *ctx, JSDebuggerLocalsGetter *getLocals, void *getLocalsOpaque)
+{
+    JSValue locals = getLocals(ctx, getLocalsOpaque);
+    if (JS_IsException(locals)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        std::fprintf(stderr, "[GxDebugger] failed to collect locals\n");
+        return;
+    }
+
+    printLocals(ctx, locals);
+    JS_FreeValue(ctx, locals);
+}
+
+static void printInteractiveHelp()
+{
+    std::fprintf(stderr,
+                 "[GxDebugger] help\n"
+                 "  Execution:\n"
+                 "    c, continue, resume       Continue running until the next breakpoint or pause.\n"
+                 "    s, step, stepInto         Step into the next JS source location, entering JS calls.\n"
+                 "    n, next, stepOver         Step over JS calls and pause at the next location in this frame.\n"
+                 "    finish, out, stepOut      Run until the current JS function returns to its caller.\n"
+                 "    q, quit                   Stop execution with a debugger error.\n"
+                 "\n"
+                 "  Inspection:\n"
+                 "    bt, backtrace             Print the current JS call stack.\n"
+                 "    locals, vars, scope       Print current frame arguments and local variables.\n"
+                 "    args                      Alias for locals; args and locals share one view.\n"
+                 "    w, watch, watches         Evaluate all configured watch expressions.\n"
+                 "    p <expr>, print <expr>    Evaluate one expression in the current frame locals.\n"
+                 "\n"
+                 "  Breakpoints:\n"
+                 "    lb, bl, breakpoints       List breakpoints with numeric ids.\n"
+                 "    info breakpoints          List breakpoints, GDB-style alias.\n"
+                 "    b <file>:<line>           Add a breakpoint. Use . for the current paused file.\n"
+                 "    break <file>:<line>       Add a breakpoint, long form.\n"
+                 "    d <id>                    Delete a breakpoint by id from lb.\n"
+                 "    d <file>:<line>           Delete a breakpoint by location. . is supported.\n"
+                 "    delete, clear, remove     Aliases for d.\n"
+                 "\n"
+                 "  Examples:\n"
+                 "    b .:42                    Break at line 42 in the current file.\n"
+                 "    b examples/js/test.js:27  Break at a path suffix or full path.\n"
+                 "    locals                    Print visible variables at the current stop.\n"
+                 "    p self.a + b              Print an expression using current locals.\n"
+                 "    d 2                       Delete breakpoint #2.\n");
+}
+
+static bool runInteractiveDebugger(JSContext *ctx, GxQjsDebuggerState *state,
+                                   JSDebuggerLocalsGetter *getLocals, void *getLocalsOpaque,
+                                   const GxDebuggerLocation &current)
+{
+    flushDebuggerOutput();
+    std::fprintf(stderr,
+                 "[GxDebugger] interactive mode. Type h or help for commands.\n");
+
+    char input[2048];
+    while (!state->resumeRequested) {
+        flushDebuggerOutput();
+        std::fprintf(stderr, "(gxdbg) ");
+        std::fflush(stderr);
+
+        if (!std::fgets(input, sizeof(input), stdin)) {
+            state->resumeRequested = true;
+            clearDebuggerStep(state);
+            break;
+        }
+
+        const std::string command = trimDebuggerCommand(input);
+        if (command.empty()) {
+            continue;
+        }
+        if (command == "c" || command == "continue" || command == "resume") {
+            state->resumeRequested = true;
+            clearDebuggerStep(state);
+            break;
+        }
+        if (command == "s" || command == "step" || command == "stepInto") {
+            requestDebuggerStepFromLocation(state, GxDebuggerStepKind::Into, current);
+            break;
+        }
+        if (command == "n" || command == "next" || command == "stepOver") {
+            requestDebuggerStepFromLocation(state, GxDebuggerStepKind::Over, current);
+            break;
+        }
+        if (command == "finish" || command == "out" || command == "stepOut") {
+            requestDebuggerStepFromLocation(state, GxDebuggerStepKind::Out, current);
+            break;
+        }
+        if (command == "bt" || command == "backtrace") {
+            printCurrentJsStack(ctx);
+            continue;
+        }
+        if (command == "locals" || command == "vars" || command == "scope" || command == "args") {
+            printLocalsWithLazyLocals(ctx, getLocals, getLocalsOpaque);
+            continue;
+        }
+        if (command == "lb" || command == "bl" || command == "breakpoints" || command == "info breakpoints") {
+            printBreakpointList(state);
+            continue;
+        }
+        if (command.rfind("b ", 0) == 0 || command.rfind("break ", 0) == 0) {
+            const size_t offset = command[0] == 'b' ? 2 : 6;
+            const std::string spec = trimDebuggerCommand(command.substr(offset));
+            std::string file;
+            int line = 0;
+            if (!parseBreakpointSpec(ctx, spec, &current.file, &file, &line)) {
+                std::fprintf(stderr, "[GxDebugger] breakpoint expects <file>:<line>\n");
+            } else {
+                state->breakpoints.emplace(file, line);
+                state->suppressedBreakpoints.clear();
+                updateDebuggerHandler(ctx, state);
+                size_t breakpointId = 0;
+                for (const auto &breakpoint: collectBreakpointViews(state)) {
+                    if (breakpoint.file == file && breakpoint.line == line) {
+                        breakpointId = breakpoint.id;
+                        break;
+                    }
+                }
+                std::fprintf(stderr, "[GxDebugger] breakpoint added #%zu %s:%d\n",
+                             breakpointId, file.c_str(), line);
+            }
+            continue;
+        }
+        if (command.rfind("d ", 0) == 0 || command.rfind("delete ", 0) == 0
+            || command.rfind("clear ", 0) == 0 || command.rfind("remove ", 0) == 0) {
+            size_t offset = 2;
+            if (command.rfind("delete ", 0) == 0) {
+                offset = 7;
+            } else if (command.rfind("clear ", 0) == 0) {
+                offset = 6;
+            } else if (command.rfind("remove ", 0) == 0) {
+                offset = 7;
+            }
+            const std::string spec = trimDebuggerCommand(command.substr(offset));
+            if (spec.empty()) {
+                std::fprintf(stderr, "[GxDebugger] delete expects <id> or <file>:<line>\n");
+            } else if (!removeBreakpointBySpec(ctx, state, spec, &current.file)) {
+                std::fprintf(stderr, "[GxDebugger] breakpoint not found: %s\n", spec.c_str());
+            } else {
+                state->suppressedBreakpoints.clear();
+                updateDebuggerHandler(ctx, state);
+                std::fprintf(stderr, "[GxDebugger] breakpoint removed: %s\n", spec.c_str());
+            }
+            continue;
+        }
+        if (command == "w" || command == "watch" || command == "watches") {
+            printWatchesWithLazyLocals(ctx, state, getLocals, getLocalsOpaque);
+            continue;
+        }
+        if (command == "q" || command == "quit") {
+            state->resumeRequested = false;
+            clearDebuggerStep(state);
+            return false;
+        }
+        if (command == "h" || command == "help") {
+            printInteractiveHelp();
+            continue;
+        }
+        if (command.rfind("p ", 0) == 0 || command.rfind("print ", 0) == 0) {
+            const size_t offset = command[0] == 'p' ? 2 : 6;
+            const std::string expr = trimDebuggerCommand(command.substr(offset));
+            if (expr.empty()) {
+                std::fprintf(stderr, "[GxDebugger] print expects an expression\n");
+            } else {
+                printExpressionWithLazyLocals(ctx, state, getLocals, getLocalsOpaque, expr);
+            }
+            continue;
+        }
+
+        std::fprintf(stderr, "[GxDebugger] unknown command: %s\n", command.c_str());
+    }
+
+    state->resumeRequested = false;
+    return true;
+}
+
 static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, int colNum,
-                             uint64_t frameId, JSDebuggerLocalsGetter *getLocals,
+                             uint64_t frameId, uint32_t frameDepth, JSDebuggerLocalsGetter *getLocals,
                              void *getLocalsOpaque, void *opaque)
 {
     GxQjsDebuggerState *state = static_cast<GxQjsDebuggerState *>(opaque);
@@ -387,6 +1084,7 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
     }
 
     const std::string file = filename ? filename : "<anonymous>";
+    const GxDebuggerLocation current = makeDebuggerLocation(file, lineNum, colNum, frameId, frameDepth);
     auto suppressedIt = state->suppressedBreakpoints.find(frameId);
     if (suppressedIt != state->suppressedBreakpoints.end()
         && (suppressedIt->second.first != file || suppressedIt->second.second != lineNum)) {
@@ -397,11 +1095,13 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
     const bool breakpointHit = hasBreakpointAt(state, file, lineNum);
     const bool suppressed = suppressedIt != state->suppressedBreakpoints.end();
     const bool pauseHit = state->pauseRequested;
-    if (!pauseHit && (!breakpointHit || suppressed)) {
+    const bool stepHit = shouldStopForStep(state, current);
+    if (!pauseHit && !stepHit && (!breakpointHit || suppressed)) {
         return 0;
     }
 
     state->pauseRequested = false;
+    clearDebuggerStep(state);
     if (breakpointHit) {
         state->suppressedBreakpoints[frameId] = {file, lineNum};
     }
@@ -410,16 +1110,16 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
     if (state->printStackOnBreak) {
         printCurrentJsStack(ctx);
     }
-    if (!state->watches.empty()) {
-        JSValue locals = getLocals(ctx, getLocalsOpaque);
-        if (JS_IsException(locals)) {
-            JS_FreeValue(ctx, JS_GetException(ctx));
-            std::fprintf(stderr, "[GxDebugger] failed to collect locals for watches\n");
-        } else {
-            printWatches(ctx, state, locals);
-            JS_FreeValue(ctx, locals);
+    printWatchesWithLazyLocals(ctx, state, getLocals, getLocalsOpaque);
+
+    if (state->interactiveOnBreak) {
+        if (!runInteractiveDebugger(ctx, state, getLocals, getLocalsOpaque, current)) {
+            return 1;
         }
+        updateDebuggerHandler(ctx, state);
+        return 0;
     }
+
     if (state->trapOnBreak) {
         nativeDebugBreak();
     }
@@ -439,10 +1139,22 @@ static void installGxDebugger(JSContext *ctx, GxQjsDebuggerState *debuggerState)
                       JS_NewCFunction(ctx, js_gxDebuggerClearBreakpoint, "clearBreakpoint", 2));
     JS_SetPropertyStr(ctx, debuggerObj, "clearAllBreakpoints",
                       JS_NewCFunction(ctx, js_gxDebuggerClearAllBreakpoints, "clearAllBreakpoints", 0));
+    JS_SetPropertyStr(ctx, debuggerObj, "listBreakpoints",
+                      JS_NewCFunction(ctx, js_gxDebuggerListBreakpoints, "listBreakpoints", 0));
     JS_SetPropertyStr(ctx, debuggerObj, "pause",
                       JS_NewCFunction(ctx, js_gxDebuggerPause, "pause", 0));
+    JS_SetPropertyStr(ctx, debuggerObj, "resume",
+                      JS_NewCFunction(ctx, js_gxDebuggerResume, "resume", 0));
+    JS_SetPropertyStr(ctx, debuggerObj, "stepInto",
+                      JS_NewCFunction(ctx, js_gxDebuggerStepInto, "stepInto", 0));
+    JS_SetPropertyStr(ctx, debuggerObj, "stepOver",
+                      JS_NewCFunction(ctx, js_gxDebuggerStepOver, "stepOver", 0));
+    JS_SetPropertyStr(ctx, debuggerObj, "stepOut",
+                      JS_NewCFunction(ctx, js_gxDebuggerStepOut, "stepOut", 0));
     JS_SetPropertyStr(ctx, debuggerObj, "setTrapOnBreak",
                       JS_NewCFunction(ctx, js_gxDebuggerSetTrapOnBreak, "setTrapOnBreak", 1));
+    JS_SetPropertyStr(ctx, debuggerObj, "setInteractiveOnBreak",
+                      JS_NewCFunction(ctx, js_gxDebuggerSetInteractiveOnBreak, "setInteractiveOnBreak", 1));
     JS_SetPropertyStr(ctx, debuggerObj, "setPrintStackOnBreak",
                       JS_NewCFunction(ctx, js_gxDebuggerSetPrintStackOnBreak, "setPrintStackOnBreak", 1));
     JS_SetPropertyStr(ctx, debuggerObj, "watch",

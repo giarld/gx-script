@@ -7725,15 +7725,20 @@ static int js_debugger_poll(JSContext *ctx, JSFunctionBytecode *b, uint8_t *pc)
 {
     JSRuntime *rt = ctx->rt;
     JSStackFrame *sf = rt->current_stack_frame;
+    JSStackFrame *depth_sf;
     JSDebuggerLocalsState locals_state;
     const char *filename;
     int line_num, col_num;
     uint32_t pc_value;
+    uint32_t frame_depth;
     int ret;
 
     if (!rt->debugger_handler)
         return 0;
 
+    frame_depth = 0;
+    for(depth_sf = sf; depth_sf; depth_sf = depth_sf->prev_frame)
+        frame_depth++;
     pc_value = pc - b->byte_code_buf;
     line_num = find_line_num(ctx, b, pc_value, &col_num);
     filename = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
@@ -7741,6 +7746,7 @@ static int js_debugger_poll(JSContext *ctx, JSFunctionBytecode *b, uint8_t *pc)
     locals_state.b = b;
     ret = rt->debugger_handler(ctx, filename ? filename : "<anonymous>",
                                line_num, col_num, sf->debugger_frame_id,
+                               frame_depth,
                                js_debugger_get_locals, &locals_state,
                                rt->debugger_opaque);
     JS_FreeCString(ctx, filename);
