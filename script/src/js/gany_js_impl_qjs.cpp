@@ -12,8 +12,6 @@
 #include <cctype>
 #include <csignal>
 #include <cstdio>
-#include <cstring>
-#include <fstream>
 #include <map>
 #include <set>
 #include <string>
@@ -551,88 +549,6 @@ static bool isBreakpointFileMatch(const std::string &breakpointFile, const std::
     return false;
 }
 
-static bool readSourceLine(const std::string &file, int lineNum, std::string *lineOut)
-{
-    if (!lineOut || lineNum <= 0) {
-        return false;
-    }
-
-    std::ifstream input(file);
-    if (!input.is_open()) {
-        return false;
-    }
-
-    std::string line;
-    for (int currentLine = 1; std::getline(input, line); ++currentLine) {
-        if (currentLine == lineNum) {
-            *lineOut = line;
-            return true;
-        }
-    }
-    return false;
-}
-
-static std::string trimSourceLine(const std::string &line)
-{
-    size_t begin = 0;
-    while (begin < line.size() && std::isspace(static_cast<unsigned char>(line[begin]))) {
-        ++begin;
-    }
-
-    size_t end = line.size();
-    while (end > begin && std::isspace(static_cast<unsigned char>(line[end - 1]))) {
-        --end;
-    }
-    return line.substr(begin, end - begin);
-}
-
-static bool isDebuggerSignificantSourceLine(const std::string &line)
-{
-    const std::string trimmed = trimSourceLine(line);
-    if (trimmed.empty()) {
-        return false;
-    }
-    return trimmed.rfind("//", 0) != 0 && trimmed.rfind("/*", 0) != 0 && trimmed.rfind("*", 0) != 0;
-}
-
-static bool isDebuggerControlHeadSourceLine(const std::string &line)
-{
-    const std::string trimmed = trimSourceLine(line);
-    const auto startsWithKeyword = [&trimmed](const char *keyword) {
-        const size_t len = std::strlen(keyword);
-        return trimmed.size() >= len && trimmed.compare(0, len, keyword) == 0
-               && (trimmed.size() == len || !std::isalnum(static_cast<unsigned char>(trimmed[len])));
-    };
-    return startsWithKeyword("if") || startsWithKeyword("for") || startsWithKeyword("while")
-           || startsWithKeyword("switch") || startsWithKeyword("try") || startsWithKeyword("catch");
-}
-
-static bool canMatchBreakpointAtPreviousSourceLine(const std::string &runtimeFile, int runtimeLine, int breakpointLine)
-{
-    const int distance = breakpointLine - runtimeLine;
-    if (distance <= 0 || distance > 5) {
-        return false;
-    }
-
-    std::string requestedLine;
-    if (!readSourceLine(runtimeFile, breakpointLine, &requestedLine)
-        || !isDebuggerSignificantSourceLine(requestedLine)) {
-        return false;
-    }
-
-    for (int line = breakpointLine - 1; line > 0; --line) {
-        std::string sourceLine;
-        if (!readSourceLine(runtimeFile, line, &sourceLine)) {
-            return false;
-        }
-        if (!isDebuggerSignificantSourceLine(sourceLine)) {
-            continue;
-        }
-        return line == runtimeLine && !isDebuggerControlHeadSourceLine(sourceLine);
-    }
-    return false;
-}
-
 static const GxDebuggerBreakpoint *findBreakpointAt(const GxQjsDebuggerState *state, const std::string &file, int lineNum)
 {
     for (const auto &breakpoint: state->breakpoints) {
@@ -640,24 +556,7 @@ static const GxDebuggerBreakpoint *findBreakpointAt(const GxQjsDebuggerState *st
             return &breakpoint.second;
         }
     }
-
-    const GxDebuggerBreakpoint *nearestBreakpoint = nullptr;
-    int nearestDistance = 0;
-    for (const auto &breakpoint: state->breakpoints) {
-        if (!isBreakpointFileMatch(breakpoint.first.first, file)) {
-            continue;
-        }
-
-        if (!canMatchBreakpointAtPreviousSourceLine(file, lineNum, breakpoint.first.second)) {
-            continue;
-        }
-        const int distance = breakpoint.first.second - lineNum;
-        if (!nearestBreakpoint || distance < nearestDistance) {
-            nearestBreakpoint = &breakpoint.second;
-            nearestDistance = distance;
-        }
-    }
-    return nearestBreakpoint;
+    return nullptr;
 }
 
 static std::vector<GxDebuggerBreakpointView> collectBreakpointViews(const GxQjsDebuggerState *state)
