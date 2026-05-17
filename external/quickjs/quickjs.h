@@ -1151,9 +1151,14 @@ typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
 JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
 /* return != 0 to stop the currently running JS code with an internal error */
 typedef JSValue JSDebuggerLocalsGetter(JSContext *ctx, void *opaque);
+typedef enum JSDebuggerPollKind {
+    JS_DEBUGGER_POLL_OPCODE,
+    JS_DEBUGGER_POLL_CALL,
+} JSDebuggerPollKind;
 typedef int JSDebuggerHandler(JSContext *ctx, const char *filename,
                               int line_num, int col_num, uint64_t frame_id,
                               uint32_t frame_depth, uint32_t pc_offset,
+                              JSDebuggerPollKind poll_kind,
                               JSDebuggerLocalsGetter *get_locals,
                               void *get_locals_opaque, void *opaque);
 JS_EXTERN void JS_SetDebuggerHandler(JSRuntime *rt, JSDebuggerHandler *cb, void *opaque);

@@ -42,6 +42,7 @@ struct GxDebuggerLocation
     uint64_t frameId = 0;
     uint32_t frameDepth = 0;
     uint32_t pcOffset = 0;
+    JSDebuggerPollKind pollKind = JS_DEBUGGER_POLL_OPCODE;
 };
 
 struct GxDebuggerBreakpointView
@@ -55,6 +56,13 @@ struct GxDebuggerBreakpointView
 struct GxDebuggerBreakpoint
 {
     std::string condition;
+};
+
+struct GxDebuggerSuppressedBreakpoint
+{
+    std::string file;
+    int line = 0;
+    uint32_t pcOffset = 0;
 };
 
 struct GAnyModuleExports
@@ -74,10 +82,9 @@ struct GxQjsDebuggerState
     bool printStackOnBreak = true;
     bool evaluatingWatches = false;
     GxDebuggerStepKind stepKind = GxDebuggerStepKind::None;
-    bool stepSkipCurrentLocation = false;
     GxDebuggerLocation stepOrigin;
     std::vector<std::string> watches;
-    std::map<uint64_t, std::pair<std::string, int>> suppressedBreakpoints;
+    std::map<uint64_t, GxDebuggerSuppressedBreakpoint> suppressedBreakpoints;
 };
 
 static void nativeDebugBreak()
@@ -97,7 +104,8 @@ static GxQjsDebuggerState *getDebuggerState(JSContext *ctx)
 
 static int gxQjsDebuggerPoll(JSContext *, const char *filename, int lineNum, int colNum,
                              uint64_t frameId, uint32_t frameDepth, uint32_t pcOffset,
-                             JSDebuggerLocalsGetter *getLocals, void *getLocalsOpaque, void *opaque);
+                             JSDebuggerPollKind pollKind, JSDebuggerLocalsGetter *getLocals,
+                             void *getLocalsOpaque, void *opaque);
 static std::string trimDebuggerCommand(const std::string &command);
 static std::vector<GxDebuggerBreakpointView> collectBreakpointViews(const GxQjsDebuggerState *state);
 static bool parseBreakpointSpec(JSContext *ctx, const std::string &spec, const std::string *currentFile,
@@ -344,7 +352,6 @@ static JSValue js_gxDebuggerPause(JSContext *ctx, JSValueConst, int, JSValueCons
     state->pauseRequested = true;
     state->resumeRequested = false;
     state->stepKind = GxDebuggerStepKind::None;
-    state->stepSkipCurrentLocation = false;
     state->stepOrigin = {};
     updateDebuggerHandler(ctx, state);
     return JS_UNDEFINED;
@@ -360,7 +367,6 @@ static JSValue js_gxDebuggerResume(JSContext *ctx, JSValueConst, int, JSValueCon
     state->pauseRequested = false;
     state->resumeRequested = true;
     state->stepKind = GxDebuggerStepKind::None;
-    state->stepSkipCurrentLocation = false;
     state->stepOrigin = {};
     updateDebuggerHandler(ctx, state);
     return JS_UNDEFINED;
@@ -371,7 +377,6 @@ static void requestDebuggerStep(GxQjsDebuggerState *state, GxDebuggerStepKind ki
     state->pauseRequested = false;
     state->resumeRequested = true;
     state->stepKind = kind;
-    state->stepSkipCurrentLocation = false;
     state->stepOrigin = {};
 }
 
@@ -782,7 +787,31 @@ static void printBreakpointList(const GxQjsDebuggerState *state)
     }
 }
 
-static void printCurrentJsStack(JSContext *ctx)
+static std::string rewriteTopStackFrameLocation(const std::string &stack, const GxDebuggerLocation *current)
+{
+    if (!current || !current->valid || stack.empty()) {
+        return stack;
+    }
+
+    const size_t lineEnd = stack.find('\n');
+    const size_t openParen = stack.find(" (");
+    if (openParen == std::string::npos || (lineEnd != std::string::npos && openParen > lineEnd)) {
+        return stack;
+    }
+
+    const size_t closeParen = stack.find(')', openParen + 2);
+    if (closeParen == std::string::npos || (lineEnd != std::string::npos && closeParen > lineEnd)) {
+        return stack;
+    }
+
+    std::string rewritten = stack;
+    const std::string location = " (" + current->file + ":" + std::to_string(current->line) + ":"
+                                 + std::to_string(current->col) + ")";
+    rewritten.replace(openParen, closeParen - openParen + 1, location);
+    return rewritten;
+}
+
+static void printCurrentJsStack(JSContext *ctx, const GxDebuggerLocation *current = nullptr)
 {
     JSValue errorVal = JS_NewError(ctx);
     if (JS_IsException(errorVal)) {
@@ -799,7 +828,8 @@ static void printCurrentJsStack(JSContext *ctx)
 
     const char *stack = JS_ToCString(ctx, stackVal);
     if (stack) {
-        std::fprintf(stderr, "%s\n", stack);
+        const std::string stackText = rewriteTopStackFrameLocation(stack, current);
+        std::fprintf(stderr, "%s\n", stackText.c_str());
         JS_FreeCString(ctx, stack);
     }
 
@@ -976,7 +1006,8 @@ static const char *stepKindName(GxDebuggerStepKind kind)
 }
 
 static GxDebuggerLocation makeDebuggerLocation(const std::string &file, int lineNum, int colNum,
-                                               uint64_t frameId, uint32_t frameDepth, uint32_t pcOffset)
+                                               uint64_t frameId, uint32_t frameDepth, uint32_t pcOffset,
+                                               JSDebuggerPollKind pollKind)
 {
     GxDebuggerLocation location;
     location.valid = true;
@@ -986,13 +1017,14 @@ static GxDebuggerLocation makeDebuggerLocation(const std::string &file, int line
     location.frameId = frameId;
     location.frameDepth = frameDepth;
     location.pcOffset = pcOffset;
+    location.pollKind = pollKind;
     return location;
 }
 
-static bool sameDebuggerLocation(const GxDebuggerLocation &lhs, const GxDebuggerLocation &rhs)
+static bool sameDebuggerSourceLocation(const GxDebuggerLocation &lhs, const GxDebuggerLocation &rhs)
 {
     return lhs.valid && rhs.valid && lhs.frameId == rhs.frameId && lhs.file == rhs.file
-           && lhs.line == rhs.line && lhs.col == rhs.col && lhs.pcOffset == rhs.pcOffset;
+           && lhs.line == rhs.line && lhs.col == rhs.col;
 }
 
 static bool shouldStopForStep(GxQjsDebuggerState *state, const GxDebuggerLocation &current)
@@ -1003,8 +1035,7 @@ static bool shouldStopForStep(GxQjsDebuggerState *state, const GxDebuggerLocatio
     if (!state->stepOrigin.valid) {
         return true;
     }
-    if (state->stepSkipCurrentLocation && sameDebuggerLocation(current, state->stepOrigin)) {
-        state->stepSkipCurrentLocation = false;
+    if (sameDebuggerSourceLocation(current, state->stepOrigin)) {
         return false;
     }
 
@@ -1030,7 +1061,6 @@ static void requestDebuggerStepFromLocation(GxQjsDebuggerState *state, GxDebugge
     state->pauseRequested = false;
     state->resumeRequested = true;
     state->stepKind = kind;
-    state->stepSkipCurrentLocation = true;
     state->stepOrigin = origin;
     std::fprintf(stderr, "[GxDebugger] %s\n", stepKindName(kind));
 }
@@ -1038,7 +1068,6 @@ static void requestDebuggerStepFromLocation(GxQjsDebuggerState *state, GxDebugge
 static void clearDebuggerStep(GxQjsDebuggerState *state)
 {
     state->stepKind = GxDebuggerStepKind::None;
-    state->stepSkipCurrentLocation = false;
     state->stepOrigin = {};
 }
 
@@ -1200,6 +1229,9 @@ static bool runInteractiveDebugger(JSContext *ctx, GxQjsDebuggerState *state,
             continue;
         }
         if (command == "c" || command == "continue" || command == "resume") {
+            if (findBreakpointAt(state, current.file, current.line)) {
+                state->suppressedBreakpoints[current.frameId] = {current.file, current.line, current.pcOffset};
+            }
             state->resumeRequested = true;
             clearDebuggerStep(state);
             break;
@@ -1217,7 +1249,7 @@ static bool runInteractiveDebugger(JSContext *ctx, GxQjsDebuggerState *state,
             break;
         }
         if (command == "bt" || command == "backtrace") {
-            printCurrentJsStack(ctx);
+            printCurrentJsStack(ctx, &current);
             continue;
         }
         if (command == "locals" || command == "vars" || command == "scope" || command == "args") {
@@ -1313,7 +1345,8 @@ static bool runInteractiveDebugger(JSContext *ctx, GxQjsDebuggerState *state,
 
 static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, int colNum,
                              uint64_t frameId, uint32_t frameDepth, uint32_t pcOffset,
-                             JSDebuggerLocalsGetter *getLocals, void *getLocalsOpaque, void *opaque)
+                             JSDebuggerPollKind pollKind, JSDebuggerLocalsGetter *getLocals,
+                             void *getLocalsOpaque, void *opaque)
 {
     GxQjsDebuggerState *state = static_cast<GxQjsDebuggerState *>(opaque);
     if (!state || lineNum <= 0) {
@@ -1324,10 +1357,12 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
     }
 
     const std::string file = filename ? filename : "<anonymous>";
-    const GxDebuggerLocation current = makeDebuggerLocation(file, lineNum, colNum, frameId, frameDepth, pcOffset);
+    const GxDebuggerLocation current = makeDebuggerLocation(file, lineNum, colNum, frameId, frameDepth, pcOffset,
+                                                            pollKind);
     auto suppressedIt = state->suppressedBreakpoints.find(frameId);
     if (suppressedIt != state->suppressedBreakpoints.end()
-        && (suppressedIt->second.first != file || suppressedIt->second.second != lineNum)) {
+        && (suppressedIt->second.file != file || suppressedIt->second.line != lineNum
+            || pcOffset < suppressedIt->second.pcOffset)) {
         state->suppressedBreakpoints.erase(suppressedIt);
         suppressedIt = state->suppressedBreakpoints.end();
     }
@@ -1336,26 +1371,27 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
     const bool pauseHit = state->pauseRequested;
     const bool stepHit = shouldStopForStep(state, current);
     const GxDebuggerBreakpoint *breakpoint = findBreakpointAt(state, file, lineNum);
-    bool breakpointHit = breakpoint != nullptr;
-    if (breakpointHit && !suppressed && !pauseHit && !stepHit) {
-        breakpointHit = shouldPauseForBreakpointCondition(ctx, state, breakpoint, getLocals, getLocalsOpaque);
-        if (!breakpointHit) {
+    const bool breakpointConfigured = breakpoint != nullptr;
+    bool breakpointPause = breakpointConfigured && !suppressed && !pauseHit && !stepHit;
+    if (breakpointPause) {
+        breakpointPause = shouldPauseForBreakpointCondition(ctx, state, breakpoint, getLocals, getLocalsOpaque);
+        if (!breakpointPause) {
             return 0;
         }
     }
-    if (!pauseHit && !stepHit && (!breakpointHit || suppressed)) {
+    if (!pauseHit && !stepHit && !breakpointPause) {
         return 0;
     }
 
     state->pauseRequested = false;
     clearDebuggerStep(state);
-    if (breakpointHit) {
-        state->suppressedBreakpoints[frameId] = {file, lineNum};
+    if (breakpointPause) {
+        state->suppressedBreakpoints[frameId] = {file, lineNum, pcOffset};
     }
 
     std::fprintf(stderr, "[GxDebugger] paused at %s:%d:%d\n", file.c_str(), lineNum, colNum);
     if (state->printStackOnBreak) {
-        printCurrentJsStack(ctx);
+        printCurrentJsStack(ctx, &current);
     }
     printWatchesWithLazyLocals(ctx, state, getLocals, getLocalsOpaque);
 

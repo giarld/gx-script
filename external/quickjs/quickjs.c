@@ -7632,13 +7632,15 @@ static int get_sleb128(int32_t *pval, const uint8_t *buf,
 }
 
 static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
-                         uint32_t pc_value, int *col)
+                         uint32_t pc_value, int *col, bool *is_mapped_pc)
 {
     const uint8_t *p_end, *p;
     int new_line_num, new_col_num, line_num, col_num, pc, v, ret;
     unsigned int op;
 
     *col = 1;
+    if (is_mapped_pc)
+        *is_mapped_pc = pc_value == 0;
     p = b->pc2line_buf;
     if (!p)
         goto fail;
@@ -7672,6 +7674,8 @@ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
         new_col_num = col_num + v;
         if (pc_value < pc)
             break;
+        if (is_mapped_pc && pc_value == (uint32_t)pc)
+            *is_mapped_pc = true;
         line_num = new_line_num;
         col_num = new_col_num;
     }
@@ -7733,7 +7737,8 @@ static JSValue js_debugger_get_locals(JSContext *ctx, void *opaque)
     return locals;
 }
 
-static int js_debugger_poll(JSContext *ctx, JSFunctionBytecode *b, uint8_t *pc)
+static int js_debugger_poll(JSContext *ctx, JSFunctionBytecode *b, uint8_t *pc,
+                            JSDebuggerPollKind poll_kind)
 {
     JSRuntime *rt = ctx->rt;
     JSStackFrame *sf = rt->current_stack_frame;
@@ -7752,13 +7757,18 @@ static int js_debugger_poll(JSContext *ctx, JSFunctionBytecode *b, uint8_t *pc)
     for(depth_sf = sf; depth_sf; depth_sf = depth_sf->prev_frame)
         frame_depth++;
     pc_value = pc - b->byte_code_buf;
-    line_num = find_line_num(ctx, b, pc_value, &col_num);
+    {
+        bool is_mapped_pc;
+        line_num = find_line_num(ctx, b, pc_value, &col_num, &is_mapped_pc);
+        if (!is_mapped_pc)
+            return 0;
+    }
     filename = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
     locals_state.sf = sf;
     locals_state.b = b;
     ret = rt->debugger_handler(ctx, filename ? filename : "<anonymous>",
                                line_num, col_num, sf->debugger_frame_id,
-                               frame_depth, pc_value,
+                               frame_depth, pc_value, poll_kind,
                                js_debugger_get_locals, &locals_state,
                                rt->debugger_opaque);
     JS_FreeCString(ctx, filename);
@@ -7932,7 +7942,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
                 uint32_t pc;
 
                 pc = sf->cur_pc - b->byte_code_buf - 1;
-                line_num1 = find_line_num(ctx, b, pc, &col_num1);
+                line_num1 = find_line_num(ctx, b, pc, &col_num1, NULL);
                 atom_str = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
                 dbuf_printf(&dbuf, " (%s", atom_str ? atom_str : "<null>");
                 JS_FreeCString(ctx, atom_str);
@@ -17521,8 +17531,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define DUMP_BYTECODE_OR_DONT(pc)
 #endif
 
+#define DEBUGGER_POLL_OPCODE_OR_DONT(pc)                                     \
+    do {                                                                     \
+        if (unlikely(rt->debugger_handler)) {                                \
+            sf->cur_pc = pc;                                                 \
+            if (unlikely(js_debugger_poll(ctx, b, pc, JS_DEBUGGER_POLL_OPCODE))) \
+                goto exception;                                              \
+        }                                                                    \
+    } while (0)
+
 #if !DIRECT_DISPATCH
-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) switch (opcode = *pc++)
+#define SWITCH(pc)      DEBUGGER_POLL_OPCODE_OR_DONT(pc); DUMP_BYTECODE_OR_DONT(pc) switch (opcode = *pc++)
 #define CASE(op)        case op
 #define DEFAULT         default
 #define BREAK           break
@@ -17533,7 +17552,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #include "quickjs-opcode.h"
         [ OP_COUNT ... 255 ] = &&case_default
     };
-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
+#define SWITCH(pc)      DEBUGGER_POLL_OPCODE_OR_DONT(pc); DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
 #define BREAK           SWITCH(pc)
@@ -17638,12 +17657,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     for(;;) {
         int call_argc;
         JSValue *call_argv;
-
-        if (unlikely(rt->debugger_handler)) {
-            sf->cur_pc = pc;
-            if (unlikely(js_debugger_poll(ctx, b, pc)))
-                goto exception;
-        }
 
         SWITCH(pc) {
         CASE(OP_push_i32):
@@ -18004,7 +18017,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
                 if (unlikely(rt->debugger_handler)) {
-                    if (unlikely(js_debugger_poll(ctx, b, pc - 1)))
+                    if (unlikely(js_debugger_poll(ctx, b, pc - 1, JS_DEBUGGER_POLL_CALL)))
                         goto exception;
                 }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
@@ -18027,7 +18040,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
                 if (unlikely(rt->debugger_handler)) {
-                    if (unlikely(js_debugger_poll(ctx, b, pc - 1)))
+                    if (unlikely(js_debugger_poll(ctx, b, pc - 1, JS_DEBUGGER_POLL_CALL)))
                         goto exception;
                 }
                 ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
@@ -18049,7 +18062,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
                 if (unlikely(rt->debugger_handler)) {
-                    if (unlikely(js_debugger_poll(ctx, b, pc - 1)))
+                    if (unlikely(js_debugger_poll(ctx, b, pc - 1, JS_DEBUGGER_POLL_CALL)))
                         goto exception;
                 }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
@@ -31804,7 +31817,7 @@ static void dump_byte_code(JSContext *ctx, int pass,
         if (source) {
             if (b) {
                 int col1;
-                line1 = find_line_num(ctx, b, pos, &col1) - line_num + 1;
+                line1 = find_line_num(ctx, b, pos, &col1, NULL) - line_num + 1;
             } else if (op == OP_source_loc) {
                 line1 = get_u32(tab + pos + 1) - line_num + 1;
             }
@@ -60608,7 +60621,7 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
         int line_num1, col_num1;
         line_num1 = find_line_num(ctx, b,
                                   sf->cur_pc - b->byte_code_buf - 1,
-                                  &col_num1);
+                                  &col_num1, NULL);
         csd->native = false;
         csd->line_num = line_num1;
         csd->col_num = col_num1;
