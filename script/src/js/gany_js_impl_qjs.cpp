@@ -10,8 +10,12 @@
 #include "gx/debug.h"
 
 #include <cctype>
+#include <csignal>
+#include <cstdio>
+#include <map>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 
@@ -25,6 +29,282 @@ struct GAnyModuleExports
     GAny defaultValue;
     std::vector<std::pair<std::string, GAny>> namedExports;
 };
+
+struct GxQjsDebuggerState
+{
+    std::set<std::pair<std::string, int>> breakpoints;
+    bool pauseRequested = false;
+    bool trapOnBreak = true;
+    bool printStackOnBreak = true;
+    std::map<uint64_t, std::pair<std::string, int>> suppressedBreakpoints;
+};
+
+static void nativeDebugBreak()
+{
+#if defined(SIGTRAP)
+    std::raise(SIGTRAP);
+#else
+    std::raise(SIGABRT);
+#endif
+}
+
+static GxQjsDebuggerState *getDebuggerState(JSContext *ctx)
+{
+    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
+    return jsState ? static_cast<GxQjsDebuggerState *>(jsState->debuggerState) : nullptr;
+}
+
+static int gxQjsDebuggerPoll(JSContext *, const char *filename, int lineNum, int colNum, uint64_t frameId, void *opaque);
+
+static void updateDebuggerHandler(JSContext *ctx, GxQjsDebuggerState *state)
+{
+    const bool active = state && (state->pauseRequested || !state->breakpoints.empty());
+    JS_SetDebuggerHandler(JS_GetRuntime(ctx), active ? gxQjsDebuggerPoll : nullptr, active ? state : nullptr);
+}
+
+static JSValue js_debugBreak(JSContext *, JSValueConst, int, JSValueConst *)
+{
+    nativeDebugBreak();
+    return JS_UNDEFINED;
+}
+
+static JSValue js_gxDebuggerSetBreakpoint(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
+{
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "setBreakpoint(file, line) expects 2 arguments");
+    }
+
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+
+    const char *file = JS_ToCString(ctx, argv[0]);
+    if (!file) {
+        return JS_EXCEPTION;
+    }
+
+    int32_t line = 0;
+    if (JS_ToInt32(ctx, &line, argv[1]) < 0) {
+        JS_FreeCString(ctx, file);
+        return JS_EXCEPTION;
+    }
+    if (line <= 0) {
+        JS_FreeCString(ctx, file);
+        return JS_ThrowRangeError(ctx, "breakpoint line must be positive");
+    }
+
+    state->breakpoints.emplace(file, line);
+    state->suppressedBreakpoints.clear();
+    updateDebuggerHandler(ctx, state);
+    JS_FreeCString(ctx, file);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_gxDebuggerClearBreakpoint(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
+{
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "clearBreakpoint(file, line) expects 2 arguments");
+    }
+
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+
+    const char *file = JS_ToCString(ctx, argv[0]);
+    if (!file) {
+        return JS_EXCEPTION;
+    }
+
+    int32_t line = 0;
+    if (JS_ToInt32(ctx, &line, argv[1]) < 0) {
+        JS_FreeCString(ctx, file);
+        return JS_EXCEPTION;
+    }
+
+    state->breakpoints.erase({file, line});
+    state->suppressedBreakpoints.clear();
+    updateDebuggerHandler(ctx, state);
+    JS_FreeCString(ctx, file);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_gxDebuggerClearAllBreakpoints(JSContext *ctx, JSValueConst, int, JSValueConst *)
+{
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+
+    state->breakpoints.clear();
+    state->suppressedBreakpoints.clear();
+    updateDebuggerHandler(ctx, state);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_gxDebuggerPause(JSContext *ctx, JSValueConst, int, JSValueConst *)
+{
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+
+    state->pauseRequested = true;
+    updateDebuggerHandler(ctx, state);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_gxDebuggerSetTrapOnBreak(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
+{
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+
+    if (argc == 0) {
+        state->trapOnBreak = true;
+        return JS_UNDEFINED;
+    }
+
+    const int enabled = JS_ToBool(ctx, argv[0]);
+    if (enabled < 0) {
+        return JS_EXCEPTION;
+    }
+
+    state->trapOnBreak = enabled == 1;
+    return JS_UNDEFINED;
+}
+
+static JSValue js_gxDebuggerSetPrintStackOnBreak(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv)
+{
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+
+    if (argc == 0) {
+        state->printStackOnBreak = true;
+        return JS_UNDEFINED;
+    }
+
+    const int enabled = JS_ToBool(ctx, argv[0]);
+    if (enabled < 0) {
+        return JS_EXCEPTION;
+    }
+
+    state->printStackOnBreak = enabled == 1;
+    return JS_UNDEFINED;
+}
+
+static bool isBreakpointFileMatch(const std::string &breakpointFile, const std::string &runtimeFile)
+{
+    if (breakpointFile == runtimeFile) {
+        return true;
+    }
+    if (runtimeFile.size() > breakpointFile.size()
+        && runtimeFile.compare(runtimeFile.size() - breakpointFile.size(), breakpointFile.size(), breakpointFile) == 0
+        && runtimeFile[runtimeFile.size() - breakpointFile.size() - 1] == '/') {
+        return true;
+    }
+    return false;
+}
+
+static bool hasBreakpointAt(const GxQjsDebuggerState *state, const std::string &file, int lineNum)
+{
+    for (const auto &breakpoint: state->breakpoints) {
+        if (breakpoint.second == lineNum && isBreakpointFileMatch(breakpoint.first, file)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void printCurrentJsStack(JSContext *ctx)
+{
+    JSValue errorVal = JS_NewError(ctx);
+    if (JS_IsException(errorVal)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return;
+    }
+
+    JSValue stackVal = JS_GetPropertyStr(ctx, errorVal, "stack");
+    if (JS_IsException(stackVal)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, errorVal);
+        return;
+    }
+
+    const char *stack = JS_ToCString(ctx, stackVal);
+    if (stack) {
+        std::fprintf(stderr, "%s\n", stack);
+        JS_FreeCString(ctx, stack);
+    }
+
+    JS_FreeValue(ctx, stackVal);
+    JS_FreeValue(ctx, errorVal);
+}
+
+static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, int colNum, uint64_t frameId, void *opaque)
+{
+    GxQjsDebuggerState *state = static_cast<GxQjsDebuggerState *>(opaque);
+    if (!state || lineNum <= 0) {
+        return 0;
+    }
+
+    const std::string file = filename ? filename : "<anonymous>";
+    auto suppressedIt = state->suppressedBreakpoints.find(frameId);
+    if (suppressedIt != state->suppressedBreakpoints.end()
+        && (suppressedIt->second.first != file || suppressedIt->second.second != lineNum)) {
+        state->suppressedBreakpoints.erase(suppressedIt);
+        suppressedIt = state->suppressedBreakpoints.end();
+    }
+
+    const bool breakpointHit = hasBreakpointAt(state, file, lineNum);
+    const bool suppressed = suppressedIt != state->suppressedBreakpoints.end();
+    const bool pauseHit = state->pauseRequested;
+    if (!pauseHit && (!breakpointHit || suppressed)) {
+        return 0;
+    }
+
+    state->pauseRequested = false;
+    if (breakpointHit) {
+        state->suppressedBreakpoints[frameId] = {file, lineNum};
+    }
+
+    std::fprintf(stderr, "[GxDebugger] paused at %s:%d:%d\n", file.c_str(), lineNum, colNum);
+    if (state->printStackOnBreak) {
+        printCurrentJsStack(ctx);
+    }
+    if (state->trapOnBreak) {
+        nativeDebugBreak();
+    }
+    updateDebuggerHandler(ctx, state);
+    return 0;
+}
+
+static void installGxDebugger(JSContext *ctx, GxQjsDebuggerState *debuggerState)
+{
+    const JSValue global = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, global, "debugBreak", JS_NewCFunction(ctx, js_debugBreak, "debugBreak", 0));
+
+    const JSValue debuggerObj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, debuggerObj, "setBreakpoint",
+                      JS_NewCFunction(ctx, js_gxDebuggerSetBreakpoint, "setBreakpoint", 2));
+    JS_SetPropertyStr(ctx, debuggerObj, "clearBreakpoint",
+                      JS_NewCFunction(ctx, js_gxDebuggerClearBreakpoint, "clearBreakpoint", 2));
+    JS_SetPropertyStr(ctx, debuggerObj, "clearAllBreakpoints",
+                      JS_NewCFunction(ctx, js_gxDebuggerClearAllBreakpoints, "clearAllBreakpoints", 0));
+    JS_SetPropertyStr(ctx, debuggerObj, "pause",
+                      JS_NewCFunction(ctx, js_gxDebuggerPause, "pause", 0));
+    JS_SetPropertyStr(ctx, debuggerObj, "setTrapOnBreak",
+                      JS_NewCFunction(ctx, js_gxDebuggerSetTrapOnBreak, "setTrapOnBreak", 1));
+    JS_SetPropertyStr(ctx, debuggerObj, "setPrintStackOnBreak",
+                      JS_NewCFunction(ctx, js_gxDebuggerSetPrintStackOnBreak, "setPrintStackOnBreak", 1));
+    JS_SetPropertyStr(ctx, global, "GxDebugger", debuggerObj);
+    JS_FreeValue(ctx, global);
+    updateDebuggerHandler(ctx, debuggerState);
+}
 
 static bool isGAnyModuleName(const char *moduleName)
 {
@@ -192,13 +472,17 @@ static int JS_ganyModuleInit(JSContext *ctx, JSModuleDef *m)
 }
 
 
-static void jsStateObjectFinalizer(JSRuntime *, JSValue val)
+static void jsStateObjectFinalizer(JSRuntime *rt, JSValue val)
 {
     const JSClassID classId = JS_GetClassID(val);
 
     JS_State *state = static_cast<JS_State *>(JS_GetOpaque(val, classId));
     if (state) {
+        JS_SetDebuggerHandler(rt, nullptr, nullptr);
         GAnyToQJS::releaseJS(state);
+        GxQjsDebuggerState *debuggerState = static_cast<GxQjsDebuggerState *>(state->debuggerState);
+        GX_DELETE(debuggerState);
+        state->debuggerState = nullptr;
         GX_DELETE(state);
     }
 }
@@ -224,6 +508,7 @@ JSContext * JS_NewCustomContext(JSRuntime *rt, bool isWorker)
     jsState->rt = rt;
     jsState->ctx = ctx;
     jsState->threadId = GThread::currentThreadId();
+    jsState->debuggerState = GX_NEW(GxQjsDebuggerState);
 
     GAnyToQJS::toJS(jsState, isWorker);
 
@@ -248,6 +533,8 @@ JSContext * JS_NewCustomContext(JSRuntime *rt, bool isWorker)
     const JSValue global = JS_GetGlobalObject(ctx);
     JS_SetPropertyStr(ctx, global, "JSState", jsStateObj);
     JS_FreeValue(ctx, global);
+
+    installGxDebugger(ctx, static_cast<GxQjsDebuggerState *>(jsState->debuggerState));
 
     return ctx;
 }

@@ -327,6 +327,73 @@ class GAnyClass extends GAnyUserObject {
 
 
 // ======================================================================
+// QuickJS Debugger Helpers
+// ======================================================================
+
+/**
+ * 立即触发一次原生调试断点。
+ *
+ * 在支持 SIGTRAP 的平台上会触发 SIGTRAP，适合配合 LLDB、Xcode 或 CLion 使用。
+ * @global
+ * @returns {void}
+ */
+function debugBreak() {}
+
+/**
+ * @namespace GxDebugger
+ * @description QuickJS 轻量断点调试接口。
+ */
+const GxDebugger = {
+    /**
+     * 设置一个源码行断点。
+     *
+     * `file` 可以是绝对路径，也可以是文件尾部路径，例如 `"test.js"` 或 `"examples/js/test.js"`。
+     * @param {string} file - 脚本文件路径或路径后缀。
+     * @param {number} line - 1-based 源码行号。
+     * @returns {void}
+     */
+    setBreakpoint: function(file, line) {},
+
+    /**
+     * 清除一个源码行断点。
+     * @param {string} file - 脚本文件路径或路径后缀。
+     * @param {number} line - 1-based 源码行号。
+     * @returns {void}
+     */
+    clearBreakpoint: function(file, line) {},
+
+    /**
+     * 清除当前运行时中的全部断点。
+     * @returns {void}
+     */
+    clearAllBreakpoints: function() {},
+
+    /**
+     * 请求在下一次可停 JS 字节码位置暂停。
+     * @returns {void}
+     */
+    pause: function() {},
+
+    /**
+     * 设置断点命中时是否触发原生 SIGTRAP。
+     *
+     * 默认开启。关闭后仍会打印断点位置和可选堆栈，但不会让原生调试器中断。
+     * @param {boolean} enabled - 是否触发原生断点。
+     * @returns {void}
+     */
+    setTrapOnBreak: function(enabled) {},
+
+    /**
+     * 设置断点命中时是否打印当前 JS 调用堆栈。
+     *
+     * 默认开启，输出格式与 QuickJS 的 `Error().stack` 一致。
+     * @param {boolean} enabled - 是否打印 JS 堆栈。
+     * @returns {void}
+     */
+    setPrintStackOnBreak: function(enabled) {}
+};
+
+// ======================================================================
 // Global GAny Object & Functions
 // ======================================================================
 

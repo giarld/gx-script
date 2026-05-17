@@ -19,6 +19,7 @@ struct JS_State
     GThread::ThreadIdType threadId;
     JSClassID ganyClassID = 0;
     uint64_t ganyModuleIdx = 0;
+    void *debuggerState = nullptr;
 };
 
 extern JSContext *JS_NewCustomContext(JSRuntime *rt, bool isWorker = false);

@@ -310,6 +310,9 @@ struct JSRuntime {
 
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
+    JSDebuggerHandler *debugger_handler;
+    void *debugger_opaque;
+    uint64_t debugger_frame_id_next;
 
     JSPromiseHook *promise_hook;
     void *promise_hook_opaque;
@@ -371,6 +374,7 @@ typedef struct JSStackFrame {
     struct JSVarRef **var_refs; /* references to arguments or local variables */
     uint8_t *cur_pc; /* only used in bytecode functions : PC of the
                         instruction after the call */
+    uint64_t debugger_frame_id;
     uint16_t var_ref_count; /* number of var refs */
     uint16_t arg_count;
     bool is_strict_mode;
@@ -2098,6 +2102,12 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
 {
     rt->interrupt_handler = cb;
     rt->interrupt_opaque = opaque;
+}
+
+void JS_SetDebuggerHandler(JSRuntime *rt, JSDebuggerHandler *cb, void *opaque)
+{
+    rt->debugger_handler = cb;
+    rt->debugger_opaque = opaque;
 }
 
 void JS_SetCanBlock(JSRuntime *rt, bool can_block)
@@ -7670,6 +7680,31 @@ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
 fail:
     /* should never happen */
     return b->line_num;
+}
+
+static int js_debugger_poll(JSContext *ctx, JSFunctionBytecode *b, uint8_t *pc)
+{
+    JSRuntime *rt = ctx->rt;
+    const char *filename;
+    int line_num, col_num;
+    uint32_t pc_value;
+    int ret;
+
+    if (!rt->debugger_handler)
+        return 0;
+
+    pc_value = pc - b->byte_code_buf;
+    line_num = find_line_num(ctx, b, pc_value, &col_num);
+    filename = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
+    ret = rt->debugger_handler(ctx, filename ? filename : "<anonymous>",
+                               line_num, col_num, rt->current_stack_frame->debugger_frame_id,
+                               rt->debugger_opaque);
+    JS_FreeCString(ctx, filename);
+    if (ret) {
+        JS_ThrowInternalError(ctx, "debugger stopped execution");
+        return -1;
+    }
+    return 0;
 }
 
 /* in order to avoid executing arbitrary code during the stack trace
@@ -17527,6 +17562,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     pc = b->byte_code_buf;
     /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
     sf->cur_pc = NULL;
+    sf->debugger_frame_id = ++rt->debugger_frame_id_next;
     sf->prev_frame = rt->current_stack_frame;
     rt->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
@@ -17540,6 +17576,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     for(;;) {
         int call_argc;
         JSValue *call_argv;
+
+        if (unlikely(rt->debugger_handler)) {
+            sf->cur_pc = pc;
+            if (unlikely(js_debugger_poll(ctx, b, pc)))
+                goto exception;
+        }
 
         SWITCH(pc) {
         CASE(OP_push_i32):
@@ -17899,6 +17941,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             has_call_argc:
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
+                if (unlikely(rt->debugger_handler)) {
+                    if (unlikely(js_debugger_poll(ctx, b, pc - 1)))
+                        goto exception;
+                }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                           JS_UNDEFINED, call_argc,
                                           vc(call_argv), 0);
@@ -17918,6 +17964,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
+                if (unlikely(rt->debugger_handler)) {
+                    if (unlikely(js_debugger_poll(ctx, b, pc - 1)))
+                        goto exception;
+                }
                 ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
                                                      call_argv[-1], call_argc,
                                                      vc(call_argv), 0);
@@ -17936,6 +17986,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
+                if (unlikely(rt->debugger_handler)) {
+                    if (unlikely(js_debugger_poll(ctx, b, pc - 1)))
+                        goto exception;
+                }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                           JS_UNDEFINED, call_argc,
                                           vc(call_argv), 0);
