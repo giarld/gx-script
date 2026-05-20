@@ -71,8 +71,9 @@ at module top level before using them in callbacks.
 
 The QuickJS runtime exposes a lightweight debugger through the global
 `GxDebugger` object. It supports source-line breakpoints, exception
-breakpoints, manual pause/resume, single stepping, stack printing, watch
-expressions, and an optional interactive command-line mode.
+breakpoints, `debugger;` statements, manual pause/resume, single stepping,
+stack printing, watch expressions, and an optional interactive command-line
+mode.
 
 ```js
 GxDebugger.setBreakpoint(".", 27);
@@ -129,6 +130,12 @@ GxDebugger.stepOut();
 `stepInto()` enters JavaScript calls, `stepOver()` skips over calls in the
 current frame, and `stepOut()` runs until the current JavaScript function
 returns to its caller.
+
+JavaScript `debugger;` statements also pause through the same GxDebugger flow:
+
+```js
+debugger;
+```
 
 ### Exception Breakpoints
 

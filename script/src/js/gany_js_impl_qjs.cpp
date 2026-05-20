@@ -119,9 +119,11 @@ static uint32_t computeDebuggerPollMask(const GxQjsDebuggerState *state);
 
 static void updateDebuggerHandler(JSContext *ctx, GxQjsDebuggerState *state)
 {
+    JSRuntime *rt = JS_GetRuntime(ctx);
     const uint32_t pollMask = computeDebuggerPollMask(state);
-    JS_SetDebuggerHandlerWithPollMask(JS_GetRuntime(ctx), pollMask ? gxQjsDebuggerPoll : nullptr,
+    JS_SetDebuggerHandlerWithPollMask(rt, pollMask ? gxQjsDebuggerPoll : nullptr,
                                       pollMask ? state : nullptr, pollMask);
+    JS_SetDebuggerStatementHandler(rt, state ? gxQjsDebuggerPoll : nullptr, state);
 }
 
 static JSValue js_debugBreak(JSContext *, JSValueConst, int, JSValueConst *)
@@ -825,6 +827,7 @@ static void beginWatchEvaluation(JSContext *ctx, GxQjsDebuggerState *state)
 {
     state->evaluatingWatches = true;
     JS_SetDebuggerHandler(JS_GetRuntime(ctx), nullptr, nullptr);
+    JS_SetDebuggerStatementHandler(JS_GetRuntime(ctx), nullptr, nullptr);
 }
 
 static void endWatchEvaluation(JSContext *ctx, GxQjsDebuggerState *state)
@@ -1334,6 +1337,7 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
     const bool pauseHit = state->pauseRequested;
     const bool stepHit = shouldStopForStep(state, current);
     const bool exceptionHit = pollKind == JS_DEBUGGER_POLL_EXCEPTION && state->pauseOnException;
+    const bool debuggerStatementHit = pollKind == JS_DEBUGGER_POLL_DEBUGGER;
     const GxDebuggerBreakpoint *breakpoint = findBreakpointAt(state, file, lineNum);
     const bool breakpointConfigured = breakpoint != nullptr;
     bool breakpointPause = breakpointConfigured && !suppressed && !pauseHit && !stepHit;
@@ -1343,7 +1347,7 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
             return 0;
         }
     }
-    if (!pauseHit && !stepHit && !breakpointPause && !exceptionHit) {
+    if (!pauseHit && !stepHit && !breakpointPause && !exceptionHit && !debuggerStatementHit) {
         return 0;
     }
 
@@ -1355,6 +1359,9 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
 
     if (exceptionHit) {
         std::fprintf(stderr, "[GxDebugger] paused on exception at %s:%d:%d\n", file.c_str(), lineNum, colNum);
+    } else if (debuggerStatementHit) {
+        std::fprintf(stderr, "[GxDebugger] paused on debugger statement at %s:%d:%d\n",
+                     file.c_str(), lineNum, colNum);
     } else {
         std::fprintf(stderr, "[GxDebugger] paused at %s:%d:%d\n", file.c_str(), lineNum, colNum);
     }
@@ -1594,6 +1601,7 @@ static void jsStateObjectFinalizer(JSRuntime *rt, JSValue val)
     JS_State *state = static_cast<JS_State *>(JS_GetOpaque(val, classId));
     if (state) {
         JS_SetDebuggerHandler(rt, nullptr, nullptr);
+        JS_SetDebuggerStatementHandler(rt, nullptr, nullptr);
         GAnyToQJS::releaseJS(state);
         GxQjsDebuggerState *debuggerState = static_cast<GxQjsDebuggerState *>(state->debuggerState);
         GX_DELETE(debuggerState);

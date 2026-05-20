@@ -313,6 +313,8 @@ struct JSRuntime {
     JSDebuggerHandler *debugger_handler;
     void *debugger_opaque;
     uint32_t debugger_poll_mask;
+    JSDebuggerHandler *debugger_statement_handler;
+    void *debugger_statement_opaque;
     bool debugger_exception_pending;
     uint64_t debugger_frame_id_next;
 
@@ -2121,6 +2123,12 @@ void JS_SetDebuggerHandlerWithPollMask(JSRuntime *rt, JSDebuggerHandler *cb, voi
     rt->debugger_poll_mask = cb ? poll_mask : JS_DEBUGGER_POLL_MASK_NONE;
     if (!(rt->debugger_poll_mask & JS_DEBUGGER_POLL_MASK_EXCEPTION))
         rt->debugger_exception_pending = false;
+}
+
+void JS_SetDebuggerStatementHandler(JSRuntime *rt, JSDebuggerHandler *cb, void *opaque)
+{
+    rt->debugger_statement_handler = cb;
+    rt->debugger_statement_opaque = opaque;
 }
 
 void JS_SetCanBlock(JSRuntime *rt, bool can_block)
@@ -7761,10 +7769,12 @@ static JSValue js_debugger_get_locals(JSContext *ctx, void *opaque)
     return locals;
 }
 
-static int js_debugger_poll_dispatch(JSContext *ctx, JSStackFrame *sf,
-                                     JSFunctionBytecode *b, uint8_t *pc,
-                                     JSDebuggerPollKind poll_kind,
-                                     JSValueConst event_data)
+static int js_debugger_poll_dispatch_handler(JSContext *ctx, JSStackFrame *sf,
+                                             JSFunctionBytecode *b, uint8_t *pc,
+                                             JSDebuggerPollKind poll_kind,
+                                             JSValueConst event_data,
+                                             JSDebuggerHandler *handler,
+                                             void *handler_opaque)
 {
     JSRuntime *rt = ctx->rt;
     JSStackFrame *depth_sf;
@@ -7774,10 +7784,6 @@ static int js_debugger_poll_dispatch(JSContext *ctx, JSStackFrame *sf,
     uint32_t pc_value;
     uint32_t frame_depth;
     int ret;
-
-    if (!rt->debugger_handler
-        || !(rt->debugger_poll_mask & js_debugger_poll_mask_for_kind(poll_kind)))
-        return 0;
 
     frame_depth = 0;
     for(depth_sf = sf; depth_sf; depth_sf = depth_sf->prev_frame)
@@ -7792,27 +7798,48 @@ static int js_debugger_poll_dispatch(JSContext *ctx, JSStackFrame *sf,
     filename = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
     locals_state.sf = sf;
     locals_state.b = b;
-    ret = rt->debugger_handler(ctx, filename ? filename : "<anonymous>",
-                               line_num, col_num, sf->debugger_frame_id,
-                               frame_depth, pc_value, poll_kind, event_data,
-                               js_debugger_get_locals, &locals_state,
-                               rt->debugger_opaque);
+    ret = handler(ctx, filename ? filename : "<anonymous>",
+                  line_num, col_num, sf->debugger_frame_id,
+                  frame_depth, pc_value, poll_kind, event_data,
+                  js_debugger_get_locals, &locals_state,
+                  handler_opaque);
     JS_FreeCString(ctx, filename);
     if (ret) {
         JSDebuggerHandler *saved_handler = rt->debugger_handler;
         void *saved_opaque = rt->debugger_opaque;
         uint32_t saved_poll_mask = rt->debugger_poll_mask;
+        JSDebuggerHandler *saved_statement_handler = rt->debugger_statement_handler;
+        void *saved_statement_opaque = rt->debugger_statement_opaque;
 
         rt->debugger_handler = NULL;
         rt->debugger_opaque = NULL;
         rt->debugger_poll_mask = JS_DEBUGGER_POLL_MASK_NONE;
+        rt->debugger_statement_handler = NULL;
+        rt->debugger_statement_opaque = NULL;
         JS_ThrowInternalError(ctx, "debugger stopped execution");
         rt->debugger_handler = saved_handler;
         rt->debugger_opaque = saved_opaque;
         rt->debugger_poll_mask = saved_poll_mask;
+        rt->debugger_statement_handler = saved_statement_handler;
+        rt->debugger_statement_opaque = saved_statement_opaque;
         return -1;
     }
     return 0;
+}
+
+static int js_debugger_poll_dispatch(JSContext *ctx, JSStackFrame *sf,
+                                     JSFunctionBytecode *b, uint8_t *pc,
+                                     JSDebuggerPollKind poll_kind,
+                                     JSValueConst event_data)
+{
+    JSRuntime *rt = ctx->rt;
+
+    if (!rt->debugger_handler
+        || !(rt->debugger_poll_mask & js_debugger_poll_mask_for_kind(poll_kind)))
+        return 0;
+
+    return js_debugger_poll_dispatch_handler(ctx, sf, b, pc, poll_kind, event_data,
+                                             rt->debugger_handler, rt->debugger_opaque);
 }
 
 static int js_debugger_poll(JSContext *ctx, JSFunctionBytecode *b, uint8_t *pc,
@@ -7827,6 +7854,28 @@ static int js_debugger_poll(JSContext *ctx, JSFunctionBytecode *b, uint8_t *pc,
 
     return js_debugger_poll_dispatch(ctx, sf, b, pc,
                                      poll_kind, JS_UNDEFINED);
+}
+
+static int js_debugger_poll_debugger_statement(JSContext *ctx, JSFunctionBytecode *b,
+                                               uint8_t *pc)
+{
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *sf = rt->current_stack_frame;
+
+    if (!sf || !b || !pc)
+        return 0;
+
+    if (rt->debugger_statement_handler) {
+        return js_debugger_poll_dispatch_handler(ctx, sf, b, pc,
+                                                 JS_DEBUGGER_POLL_DEBUGGER,
+                                                 JS_UNDEFINED,
+                                                 rt->debugger_statement_handler,
+                                                 rt->debugger_statement_opaque);
+    }
+
+    return js_debugger_poll_dispatch(ctx, sf, b, pc,
+                                     JS_DEBUGGER_POLL_DEBUGGER,
+                                     JS_UNDEFINED);
 }
 
 /* in order to avoid executing arbitrary code during the stack trace
@@ -20187,6 +20236,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             ret_val = JS_UNDEFINED;
             goto done_generator;
 
+        CASE(OP_debugger):
+            sf->cur_pc = pc;
+            if (unlikely(js_debugger_poll_debugger_statement(ctx, b, pc - 1)))
+                goto exception;
+            BREAK;
         CASE(OP_nop):
             BREAK;
         CASE(OP_is_undefined_or_null):
@@ -29098,7 +29152,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         break;
 
     case TOK_DEBUGGER:
-        /* currently no debugger, so just skip the keyword */
+        emit_source_loc(s);
+        emit_op(s, OP_debugger);
         if (next_token(s))
             goto fail;
         if (js_parse_expect_semi(s))
@@ -37020,7 +37075,7 @@ typedef enum BCTagEnum {
     BC_TAG_SYMBOL,
 } BCTagEnum;
 
-#define BC_VERSION 25
+#define BC_VERSION 26
 
 typedef struct BCWriterState {
     JSContext *ctx;
