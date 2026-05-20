@@ -351,7 +351,7 @@ function debugBreak() {}
 
 /**
  * @typedef {Object} GxDebuggerPauseState
- * @property {boolean} paused
+ * @property {boolean} paused 当前是否真的停在 debugger 中
  * @property {"pause"|"step"|"breakpoint"|"exception"|"debuggerStatement"|null} reason
  * @property {GxDebuggerPauseLocation|null} location
  * @property {boolean} pendingPause

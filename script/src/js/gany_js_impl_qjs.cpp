@@ -226,7 +226,7 @@ static JSValue js_gxDebuggerIsPaused(JSContext *ctx, JSValueConst, int, JSValueC
     if (!state) {
         return JS_ThrowInternalError(ctx, "debugger state is not initialized");
     }
-    return JS_NewBool(ctx, state->paused);
+    return JS_NewBool(ctx, state->livePaused);
 }
 
 static JSValue js_gxDebuggerGetPauseState(JSContext *ctx, JSValueConst, int, JSValueConst *)
@@ -1106,7 +1106,7 @@ static GAny buildDebuggerPauseStateObject(const GxQjsDebuggerState *state)
     const bool hasPausedStep = state && state->paused && state->pauseReason == GxDebuggerPauseReason::Step
                                && state->pauseStepKind != GxDebuggerStepKind::None;
 
-    obj["paused"] = state && state->paused;
+    obj["paused"] = state && state->livePaused;
     obj["reason"] = (state && state->paused && pauseReasonName(state->pauseReason))
                     ? GAny(std::string(pauseReasonName(state->pauseReason)))
                     : GAny::null();
