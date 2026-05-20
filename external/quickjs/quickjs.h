@@ -1154,14 +1154,27 @@ typedef JSValue JSDebuggerLocalsGetter(JSContext *ctx, void *opaque);
 typedef enum JSDebuggerPollKind {
     JS_DEBUGGER_POLL_OPCODE,
     JS_DEBUGGER_POLL_CALL,
+    JS_DEBUGGER_POLL_EXCEPTION,
 } JSDebuggerPollKind;
+enum {
+    JS_DEBUGGER_POLL_MASK_NONE = 0,
+    JS_DEBUGGER_POLL_MASK_OPCODE = 1 << JS_DEBUGGER_POLL_OPCODE,
+    JS_DEBUGGER_POLL_MASK_CALL = 1 << JS_DEBUGGER_POLL_CALL,
+    JS_DEBUGGER_POLL_MASK_EXCEPTION = 1 << JS_DEBUGGER_POLL_EXCEPTION,
+    JS_DEBUGGER_POLL_MASK_ALL = JS_DEBUGGER_POLL_MASK_OPCODE
+                                | JS_DEBUGGER_POLL_MASK_CALL
+                                | JS_DEBUGGER_POLL_MASK_EXCEPTION,
+};
 typedef int JSDebuggerHandler(JSContext *ctx, const char *filename,
                               int line_num, int col_num, uint64_t frame_id,
                               uint32_t frame_depth, uint32_t pc_offset,
                               JSDebuggerPollKind poll_kind,
+                              JSValueConst event_data,
                               JSDebuggerLocalsGetter *get_locals,
                               void *get_locals_opaque, void *opaque);
 JS_EXTERN void JS_SetDebuggerHandler(JSRuntime *rt, JSDebuggerHandler *cb, void *opaque);
+JS_EXTERN void JS_SetDebuggerHandlerWithPollMask(JSRuntime *rt, JSDebuggerHandler *cb, void *opaque,
+                                                 uint32_t poll_mask);
 /* if can_block is true, Atomics.wait() can be used */
 JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
 /* set the [IsHTMLDDA] internal slot */

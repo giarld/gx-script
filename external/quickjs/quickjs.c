@@ -312,6 +312,8 @@ struct JSRuntime {
     void *interrupt_opaque;
     JSDebuggerHandler *debugger_handler;
     void *debugger_opaque;
+    uint32_t debugger_poll_mask;
+    bool debugger_exception_pending;
     uint64_t debugger_frame_id_next;
 
     JSPromiseHook *promise_hook;
@@ -2106,8 +2108,19 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
 
 void JS_SetDebuggerHandler(JSRuntime *rt, JSDebuggerHandler *cb, void *opaque)
 {
+    JS_SetDebuggerHandlerWithPollMask(rt, cb, opaque,
+                                      cb ? (JS_DEBUGGER_POLL_MASK_OPCODE | JS_DEBUGGER_POLL_MASK_CALL)
+                                         : JS_DEBUGGER_POLL_MASK_NONE);
+}
+
+void JS_SetDebuggerHandlerWithPollMask(JSRuntime *rt, JSDebuggerHandler *cb, void *opaque,
+                                       uint32_t poll_mask)
+{
     rt->debugger_handler = cb;
     rt->debugger_opaque = opaque;
+    rt->debugger_poll_mask = cb ? poll_mask : JS_DEBUGGER_POLL_MASK_NONE;
+    if (!(rt->debugger_poll_mask & JS_DEBUGGER_POLL_MASK_EXCEPTION))
+        rt->debugger_exception_pending = false;
 }
 
 void JS_SetCanBlock(JSRuntime *rt, bool can_block)
@@ -7552,12 +7565,22 @@ JSValue JS_GetGlobalObject(JSContext *ctx)
     return js_dup(ctx->global_obj);
 }
 
+static uint32_t js_debugger_poll_mask_for_kind(JSDebuggerPollKind poll_kind)
+{
+    return 1u << (uint32_t)poll_kind;
+}
+
 /* WARNING: obj is freed */
 JSValue JS_Throw(JSContext *ctx, JSValue obj)
 {
     JSRuntime *rt = ctx->rt;
     JS_FreeValue(ctx, rt->current_exception);
     rt->current_exception = obj;
+    if (rt->debugger_handler
+        && (rt->debugger_poll_mask & JS_DEBUGGER_POLL_MASK_EXCEPTION)
+        && !rt->in_build_stack_trace) {
+        rt->debugger_exception_pending = true;
+    }
     return JS_EXCEPTION;
 }
 
@@ -7568,6 +7591,7 @@ JSValue JS_GetException(JSContext *ctx)
     JSRuntime *rt = ctx->rt;
     val = rt->current_exception;
     rt->current_exception = JS_UNINITIALIZED;
+    rt->debugger_exception_pending = false;
     return val;
 }
 
@@ -7737,11 +7761,12 @@ static JSValue js_debugger_get_locals(JSContext *ctx, void *opaque)
     return locals;
 }
 
-static int js_debugger_poll(JSContext *ctx, JSFunctionBytecode *b, uint8_t *pc,
-                            JSDebuggerPollKind poll_kind)
+static int js_debugger_poll_dispatch(JSContext *ctx, JSStackFrame *sf,
+                                     JSFunctionBytecode *b, uint8_t *pc,
+                                     JSDebuggerPollKind poll_kind,
+                                     JSValueConst event_data)
 {
     JSRuntime *rt = ctx->rt;
-    JSStackFrame *sf = rt->current_stack_frame;
     JSStackFrame *depth_sf;
     JSDebuggerLocalsState locals_state;
     const char *filename;
@@ -7750,7 +7775,8 @@ static int js_debugger_poll(JSContext *ctx, JSFunctionBytecode *b, uint8_t *pc,
     uint32_t frame_depth;
     int ret;
 
-    if (!rt->debugger_handler)
+    if (!rt->debugger_handler
+        || !(rt->debugger_poll_mask & js_debugger_poll_mask_for_kind(poll_kind)))
         return 0;
 
     frame_depth = 0;
@@ -7760,7 +7786,7 @@ static int js_debugger_poll(JSContext *ctx, JSFunctionBytecode *b, uint8_t *pc,
     {
         bool is_mapped_pc;
         line_num = find_line_num(ctx, b, pc_value, &col_num, &is_mapped_pc);
-        if (!is_mapped_pc)
+        if (!is_mapped_pc && poll_kind != JS_DEBUGGER_POLL_EXCEPTION)
             return 0;
     }
     filename = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
@@ -7768,15 +7794,39 @@ static int js_debugger_poll(JSContext *ctx, JSFunctionBytecode *b, uint8_t *pc,
     locals_state.b = b;
     ret = rt->debugger_handler(ctx, filename ? filename : "<anonymous>",
                                line_num, col_num, sf->debugger_frame_id,
-                               frame_depth, pc_value, poll_kind,
+                               frame_depth, pc_value, poll_kind, event_data,
                                js_debugger_get_locals, &locals_state,
                                rt->debugger_opaque);
     JS_FreeCString(ctx, filename);
     if (ret) {
+        JSDebuggerHandler *saved_handler = rt->debugger_handler;
+        void *saved_opaque = rt->debugger_opaque;
+        uint32_t saved_poll_mask = rt->debugger_poll_mask;
+
+        rt->debugger_handler = NULL;
+        rt->debugger_opaque = NULL;
+        rt->debugger_poll_mask = JS_DEBUGGER_POLL_MASK_NONE;
         JS_ThrowInternalError(ctx, "debugger stopped execution");
+        rt->debugger_handler = saved_handler;
+        rt->debugger_opaque = saved_opaque;
+        rt->debugger_poll_mask = saved_poll_mask;
         return -1;
     }
     return 0;
+}
+
+static int js_debugger_poll(JSContext *ctx, JSFunctionBytecode *b, uint8_t *pc,
+                            JSDebuggerPollKind poll_kind)
+{
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *sf = rt->current_stack_frame;
+
+    if (!rt->debugger_handler || !sf || !b || !pc
+        || !(rt->debugger_poll_mask & js_debugger_poll_mask_for_kind(poll_kind)))
+        return 0;
+
+    return js_debugger_poll_dispatch(ctx, sf, b, pc,
+                                     poll_kind, JS_UNDEFINED);
 }
 
 /* in order to avoid executing arbitrary code during the stack trace
@@ -17533,7 +17583,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
 #define DEBUGGER_POLL_OPCODE_OR_DONT(pc)                                     \
     do {                                                                     \
-        if (unlikely(rt->debugger_handler)) {                                \
+        if (unlikely(rt->debugger_handler                                   \
+                     && (rt->debugger_poll_mask & JS_DEBUGGER_POLL_MASK_OPCODE))) { \
             sf->cur_pc = pc;                                                 \
             if (unlikely(js_debugger_poll(ctx, b, pc, JS_DEBUGGER_POLL_OPCODE))) \
                 goto exception;                                              \
@@ -18016,7 +18067,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             has_call_argc:
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
-                if (unlikely(rt->debugger_handler)) {
+                if (unlikely(rt->debugger_handler
+                             && (rt->debugger_poll_mask & JS_DEBUGGER_POLL_MASK_CALL))) {
                     if (unlikely(js_debugger_poll(ctx, b, pc - 1, JS_DEBUGGER_POLL_CALL)))
                         goto exception;
                 }
@@ -18039,7 +18091,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
-                if (unlikely(rt->debugger_handler)) {
+                if (unlikely(rt->debugger_handler
+                             && (rt->debugger_poll_mask & JS_DEBUGGER_POLL_MASK_CALL))) {
                     if (unlikely(js_debugger_poll(ctx, b, pc - 1, JS_DEBUGGER_POLL_CALL)))
                         goto exception;
                 }
@@ -18061,7 +18114,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
-                if (unlikely(rt->debugger_handler)) {
+                if (unlikely(rt->debugger_handler
+                             && (rt->debugger_poll_mask & JS_DEBUGGER_POLL_MASK_CALL))) {
                     if (unlikely(js_debugger_poll(ctx, b, pc - 1, JS_DEBUGGER_POLL_CALL)))
                         goto exception;
                 }
@@ -20185,6 +20239,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
  exception:
+    if (rt->debugger_exception_pending
+    && rt->debugger_handler
+    && (rt->debugger_poll_mask & JS_DEBUGGER_POLL_MASK_EXCEPTION)) {
+        uint8_t *exception_pc = pc;
+        if (exception_pc > b->byte_code_buf)
+            exception_pc--;
+        rt->debugger_exception_pending = false;
+        if (js_debugger_poll_dispatch(ctx, sf, b, exception_pc,
+                                      JS_DEBUGGER_POLL_EXCEPTION,
+                                      rt->current_exception))
+            goto exception;
+    }
     if (needs_backtrace(rt->current_exception)
     || JS_IsUndefined(ctx->error_back_trace)) {
         sf->cur_pc = pc;
@@ -60991,6 +61057,13 @@ uintptr_t js_std_cmd(int cmd, ...) {
         pv = va_arg(ap, JSValue *);
         *pv = ctx->error_back_trace;
         ctx->error_back_trace = JS_UNDEFINED;
+        break;
+    case 4: // SetErrorBackTrace
+        ctx = va_arg(ap, JSContext *);
+        pv = va_arg(ap, JSValue *);
+        JS_FreeValue(ctx, ctx->error_back_trace);
+        ctx->error_back_trace = *pv;
+        *pv = JS_UNDEFINED;
         break;
     case 3: // GetStringKind
         ctx = va_arg(ap, JSContext *);

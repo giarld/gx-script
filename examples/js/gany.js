@@ -444,6 +444,16 @@ const GxDebugger = {
     setPrintStackOnBreak: function(enabled) {},
 
     /**
+     * 设置运行时 JS 异常抛出时是否暂停。
+     *
+     * 开启后，`throw`、运行时 `TypeError` 等会在抛出点暂停，即使随后会被 `try/catch` 捕获。
+     * 该能力仅作用于运行时异常；编译期语法错误不会进入此断点。
+     * @param {boolean} enabled - 是否在抛出异常时暂停。
+     * @returns {void}
+     */
+    setPauseOnException: function(enabled) {},
+
+    /**
      * 添加一个 watch expression。
      *
      * 表达式会在断点命中时基于当前 JS frame 的参数和局部变量求值。
