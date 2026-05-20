@@ -31,6 +31,16 @@ enum class GxDebuggerStepKind
     Out,
 };
 
+enum class GxDebuggerPauseReason
+{
+    None,
+    Pause,
+    Step,
+    Breakpoint,
+    Exception,
+    DebuggerStatement,
+};
+
 struct GxDebuggerLocation
 {
     bool valid = false;
@@ -80,6 +90,12 @@ struct GxQjsDebuggerState
     bool interactiveOnBreak = false;
     bool printStackOnBreak = true;
     bool evaluatingWatches = false;
+    bool paused = false;
+    bool livePaused = false;
+    GxDebuggerPauseReason pauseReason = GxDebuggerPauseReason::None;
+    GxDebuggerLocation pauseLocation;
+    GxDebuggerStepKind pauseStepKind = GxDebuggerStepKind::None;
+    GxDebuggerLocation pauseStepOrigin;
     GxDebuggerStepKind stepKind = GxDebuggerStepKind::None;
     GxDebuggerLocation stepOrigin;
     std::vector<std::string> watches;
@@ -116,6 +132,78 @@ static void printBreakpointList(const GxQjsDebuggerState *state);
 static void beginWatchEvaluation(JSContext *ctx, GxQjsDebuggerState *state);
 static void endWatchEvaluation(JSContext *ctx, GxQjsDebuggerState *state);
 static uint32_t computeDebuggerPollMask(const GxQjsDebuggerState *state);
+static GAny buildDebuggerPauseStateObject(const GxQjsDebuggerState *state);
+
+static const char *pauseReasonName(GxDebuggerPauseReason reason)
+{
+    switch (reason) {
+    case GxDebuggerPauseReason::Pause:
+        return "pause";
+    case GxDebuggerPauseReason::Step:
+        return "step";
+    case GxDebuggerPauseReason::Breakpoint:
+        return "breakpoint";
+    case GxDebuggerPauseReason::Exception:
+        return "exception";
+    case GxDebuggerPauseReason::DebuggerStatement:
+        return "debuggerStatement";
+    case GxDebuggerPauseReason::None:
+        break;
+    }
+    return nullptr;
+}
+
+static const char *stepKindStateName(GxDebuggerStepKind kind)
+{
+    switch (kind) {
+    case GxDebuggerStepKind::Into:
+        return "into";
+    case GxDebuggerStepKind::Over:
+        return "over";
+    case GxDebuggerStepKind::Out:
+        return "out";
+    case GxDebuggerStepKind::None:
+        break;
+    }
+    return nullptr;
+}
+
+static void clearPausedState(GxQjsDebuggerState *state)
+{
+    if (!state) {
+        return;
+    }
+    state->paused = false;
+    state->livePaused = false;
+    state->pauseReason = GxDebuggerPauseReason::None;
+    state->pauseLocation = {};
+    state->pauseStepKind = GxDebuggerStepKind::None;
+    state->pauseStepOrigin = {};
+}
+
+static void deactivateLivePausedState(GxQjsDebuggerState *state)
+{
+    if (!state) {
+        return;
+    }
+    state->livePaused = false;
+}
+
+static void setPausedState(GxQjsDebuggerState *state, GxDebuggerPauseReason reason,
+                           const GxDebuggerLocation &location,
+                           GxDebuggerStepKind stepKind = GxDebuggerStepKind::None,
+                           const GxDebuggerLocation &stepOrigin = {})
+{
+    if (!state) {
+        return;
+    }
+    state->paused = true;
+    state->livePaused = true;
+    state->pauseReason = reason;
+    state->pauseLocation = location;
+    state->pauseStepKind = stepKind;
+    state->pauseStepOrigin = stepKind != GxDebuggerStepKind::None ? stepOrigin : GxDebuggerLocation{};
+}
 
 static void updateDebuggerHandler(JSContext *ctx, GxQjsDebuggerState *state)
 {
@@ -130,6 +218,25 @@ static JSValue js_debugBreak(JSContext *, JSValueConst, int, JSValueConst *)
 {
     nativeDebugBreak();
     return JS_UNDEFINED;
+}
+
+static JSValue js_gxDebuggerIsPaused(JSContext *ctx, JSValueConst, int, JSValueConst *)
+{
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    if (!state) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+    return JS_NewBool(ctx, state->paused);
+}
+
+static JSValue js_gxDebuggerGetPauseState(JSContext *ctx, JSValueConst, int, JSValueConst *)
+{
+    GxQjsDebuggerState *state = getDebuggerState(ctx);
+    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
+    if (!state || !jsState) {
+        return JS_ThrowInternalError(ctx, "debugger state is not initialized");
+    }
+    return GAnyToQJS::makeGAnyToJsValue(jsState, buildDebuggerPauseStateObject(state), true);
 }
 
 static void flushDebuggerOutput()
@@ -353,6 +460,7 @@ static JSValue js_gxDebuggerPause(JSContext *ctx, JSValueConst, int, JSValueCons
         return JS_ThrowInternalError(ctx, "debugger state is not initialized");
     }
 
+    clearPausedState(state);
     state->pauseRequested = true;
     state->resumeRequested = false;
     state->stepKind = GxDebuggerStepKind::None;
@@ -368,8 +476,10 @@ static JSValue js_gxDebuggerResume(JSContext *ctx, JSValueConst, int, JSValueCon
         return JS_ThrowInternalError(ctx, "debugger state is not initialized");
     }
 
+    const bool wasLivePaused = state->livePaused;
+    clearPausedState(state);
     state->pauseRequested = false;
-    state->resumeRequested = true;
+    state->resumeRequested = wasLivePaused;
     state->stepKind = GxDebuggerStepKind::None;
     state->stepOrigin = {};
     updateDebuggerHandler(ctx, state);
@@ -378,10 +488,16 @@ static JSValue js_gxDebuggerResume(JSContext *ctx, JSValueConst, int, JSValueCon
 
 static void requestDebuggerStep(GxQjsDebuggerState *state, GxDebuggerStepKind kind)
 {
+    GxDebuggerLocation origin;
+    const bool wasLivePaused = state && state->paused && state->livePaused;
+    if (wasLivePaused) {
+        origin = state->pauseLocation;
+    }
+    clearPausedState(state);
     state->pauseRequested = false;
-    state->resumeRequested = true;
+    state->resumeRequested = wasLivePaused;
     state->stepKind = kind;
-    state->stepOrigin = {};
+    state->stepOrigin = origin;
 }
 
 static JSValue js_gxDebuggerStepInto(JSContext *ctx, JSValueConst, int, JSValueConst *)
@@ -966,6 +1082,57 @@ static const char *stepKindName(GxDebuggerStepKind kind)
     return "none";
 }
 
+static GAny buildDebuggerLocationObject(const GxDebuggerLocation &location)
+{
+    if (!location.valid) {
+        return GAny::null();
+    }
+
+    GAny obj = GAny::object();
+    obj["file"] = location.file;
+    obj["line"] = location.line;
+    obj["col"] = location.col;
+    obj["frameId"] = static_cast<int64_t>(location.frameId);
+    obj["frameDepth"] = static_cast<int64_t>(location.frameDepth);
+    obj["pcOffset"] = static_cast<int64_t>(location.pcOffset);
+    return obj;
+}
+
+static GAny buildDebuggerPauseStateObject(const GxQjsDebuggerState *state)
+{
+    GAny obj = GAny::object();
+    GAny step = GAny::object();
+    const bool hasPendingStep = state && state->stepKind != GxDebuggerStepKind::None;
+    const bool hasPausedStep = state && state->paused && state->pauseReason == GxDebuggerPauseReason::Step
+                               && state->pauseStepKind != GxDebuggerStepKind::None;
+
+    obj["paused"] = state && state->paused;
+    obj["reason"] = (state && state->paused && pauseReasonName(state->pauseReason))
+                    ? GAny(std::string(pauseReasonName(state->pauseReason)))
+                    : GAny::null();
+    obj["location"] = (state && state->paused)
+                      ? buildDebuggerLocationObject(state->pauseLocation)
+                      : GAny::null();
+    obj["pendingPause"] = state && state->pauseRequested;
+
+    step["pending"] = hasPendingStep;
+    step["kind"] = (hasPendingStep && stepKindStateName(state->stepKind))
+                   ? GAny(std::string(stepKindStateName(state->stepKind)))
+                   : (hasPausedStep && stepKindStateName(state->pauseStepKind))
+                     ? GAny(std::string(stepKindStateName(state->pauseStepKind)))
+                   : GAny::null();
+    step["origin"] = hasPendingStep
+                     ? buildDebuggerLocationObject(state->stepOrigin)
+                     : hasPausedStep
+                       ? buildDebuggerLocationObject(state->pauseStepOrigin)
+                     : GAny::null();
+
+    obj["step"] = step;
+    obj["breakpointsCount"] = static_cast<int64_t>(state ? state->breakpoints.size() : 0);
+    obj["watchesCount"] = static_cast<int64_t>(state ? state->watches.size() : 0);
+    return obj;
+}
+
 static GxDebuggerLocation makeDebuggerLocation(const std::string &file, int lineNum, int colNum,
                                                uint64_t frameId, uint32_t frameDepth, uint32_t pcOffset,
                                                JSDebuggerPollKind pollKind)
@@ -1351,8 +1518,23 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
         return 0;
     }
 
+    GxDebuggerPauseReason pauseReason = GxDebuggerPauseReason::Breakpoint;
+    if (exceptionHit) {
+        pauseReason = GxDebuggerPauseReason::Exception;
+    } else if (debuggerStatementHit) {
+        pauseReason = GxDebuggerPauseReason::DebuggerStatement;
+    } else if (pauseHit) {
+        pauseReason = GxDebuggerPauseReason::Pause;
+    } else if (stepHit) {
+        pauseReason = GxDebuggerPauseReason::Step;
+    }
+
+    const GxDebuggerStepKind pauseStepKind = stepHit ? state->stepKind : GxDebuggerStepKind::None;
+    const GxDebuggerLocation pauseStepOrigin = stepHit ? state->stepOrigin : GxDebuggerLocation{};
+
     state->pauseRequested = false;
     clearDebuggerStep(state);
+    setPausedState(state, pauseReason, current, pauseStepKind, pauseStepOrigin);
     if (breakpointPause) {
         state->suppressedBreakpoints[frameId] = {file, lineNum, pcOffset};
     }
@@ -1372,8 +1554,10 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
 
     if (state->interactiveOnBreak) {
         if (!runInteractiveDebugger(ctx, state, getLocals, getLocalsOpaque, current)) {
+            clearPausedState(state);
             return 1;
         }
+        clearPausedState(state);
         updateDebuggerHandler(ctx, state);
         return 0;
     }
@@ -1381,6 +1565,7 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
     if (state->trapOnBreak) {
         nativeDebugBreak();
     }
+    deactivateLivePausedState(state);
     updateDebuggerHandler(ctx, state);
     return 0;
 }
@@ -1401,6 +1586,10 @@ static void installGxDebugger(JSContext *ctx, GxQjsDebuggerState *debuggerState)
                       JS_NewCFunction(ctx, js_gxDebuggerListBreakpoints, "listBreakpoints", 0));
     JS_SetPropertyStr(ctx, debuggerObj, "pause",
                       JS_NewCFunction(ctx, js_gxDebuggerPause, "pause", 0));
+    JS_SetPropertyStr(ctx, debuggerObj, "isPaused",
+                      JS_NewCFunction(ctx, js_gxDebuggerIsPaused, "isPaused", 0));
+    JS_SetPropertyStr(ctx, debuggerObj, "getPauseState",
+                      JS_NewCFunction(ctx, js_gxDebuggerGetPauseState, "getPauseState", 0));
     JS_SetPropertyStr(ctx, debuggerObj, "resume",
                       JS_NewCFunction(ctx, js_gxDebuggerResume, "resume", 0));
     JS_SetPropertyStr(ctx, debuggerObj, "stepInto",
@@ -1998,6 +2187,18 @@ GAny GAnyJSImplQjs::compile(const std::string &script, const std::string &source
     js_free(ctx, bytecodeBuf);
 
     return result;
+}
+
+// ================================================================
+
+GAny GAnyJSImplQjs::getPauseState() const
+{
+    CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
+
+    const JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
+
+    return buildDebuggerPauseStateObject(static_cast<GxQjsDebuggerState *>(jsState->debuggerState));
 }
 
 // ================================================================

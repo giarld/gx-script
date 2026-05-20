@@ -52,6 +52,8 @@ public:
      * @return 成功返回 GByteArray 类型数据, 失败返回 GAnyException
      */
     virtual GAny compile(const std::string &script, const std::string &sourcePath) = 0;
+
+    virtual GAny getPauseState() const = 0;
 };
 
 #endif //GX_GANY_JS_H

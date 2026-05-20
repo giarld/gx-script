@@ -121,6 +121,8 @@ position. Once paused, execution can be resumed or stepped:
 
 ```js
 GxDebugger.pause();
+GxDebugger.isPaused();
+GxDebugger.getPauseState();
 GxDebugger.resume();
 GxDebugger.stepInto();
 GxDebugger.stepOver();
@@ -136,6 +138,45 @@ JavaScript `debugger;` statements also pause through the same GxDebugger flow:
 ```js
 debugger;
 ```
+
+`GxDebugger.getPauseState()` always returns a stable object shape:
+
+```js
+{
+    paused: false,
+    reason: null,
+    location: null,
+    pendingPause: false,
+    step: {
+        pending: false,
+        kind: null,
+        origin: null
+    },
+    breakpointsCount: 0,
+    watchesCount: 0
+}
+```
+
+When paused, `reason` is one of `"pause"`, `"step"`, `"breakpoint"`,
+`"exception"`, or `"debuggerStatement"`. `location` and `step.origin`
+contain `file`, `line`, `col`, `frameId`, `frameDepth`, and `pcOffset`.
+`step.pending` is only true while a step request is in flight; after a
+step stop, `step.kind` and `step.origin` still describe the step that led
+to the current pause.
+
+Host code can read the same snapshot shape through `GAnyJS::getPauseState()`:
+
+```cpp
+const auto js = GAnyJS::threadLocal();
+const GAny pauseState = js->getPauseState();
+```
+
+In non-interactive break flows, the last pause snapshot remains visible
+until a later `resume()` / `stepInto()` / `stepOver()` / `stepOut()` /
+`pause()` request overwrites or clears it.
+That retained snapshot is not treated as a live paused frame for step
+origin capture; later step requests start fresh unless they are issued
+from an active interactive pause.
 
 ### Exception Breakpoints
 

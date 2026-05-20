@@ -340,6 +340,27 @@ class GAnyClass extends GAnyUserObject {
 function debugBreak() {}
 
 /**
+ * @typedef {Object} GxDebuggerPauseLocation
+ * @property {string} file
+ * @property {number} line
+ * @property {number} col
+ * @property {number} frameId
+ * @property {number} frameDepth
+ * @property {number} pcOffset
+ */
+
+/**
+ * @typedef {Object} GxDebuggerPauseState
+ * @property {boolean} paused
+ * @property {"pause"|"step"|"breakpoint"|"exception"|"debuggerStatement"|null} reason
+ * @property {GxDebuggerPauseLocation|null} location
+ * @property {boolean} pendingPause
+ * @property {{pending:boolean,kind:("into"|"over"|"out"|null),origin:(GxDebuggerPauseLocation|null)}} step
+ * @property {number} breakpointsCount
+ * @property {number} watchesCount
+ */
+
+/**
  * @namespace GxDebugger
  * @description QuickJS 轻量断点调试接口。
  */
@@ -385,6 +406,18 @@ const GxDebugger = {
      * @returns {void}
      */
     pause: function() {},
+
+    /**
+     * Returns whether the debugger is currently paused.
+     * @returns {boolean}
+     */
+    isPaused: function() {},
+
+    /**
+     * Returns a stable pause-state snapshot.
+     * @returns {GxDebuggerPauseState}
+     */
+    getPauseState: function() {},
 
     /**
      * 从 debugger 暂停状态继续执行。

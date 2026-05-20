@@ -49,6 +49,8 @@ public:
 
     GAny compile(const std::string &script, const std::string &sourcePath) override;
 
+    GAny getPauseState() const override;
+
 public:
     const JS_State *getJSState() const;
 

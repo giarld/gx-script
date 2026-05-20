@@ -208,5 +208,6 @@ REGISTER_GANY_MODULE(GxScript)
         .func("evalFile", [](GAnyJS &self, const std::string &filePath) {
             return self.evalFile(filePath);
         })
-        .func("compile", &GAnyJS::compile);
+        .func("compile", &GAnyJS::compile)
+        .func("getPauseState", &GAnyJS::getPauseState);
 }
