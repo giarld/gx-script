@@ -49,6 +49,38 @@ public:
 
     GAny compile(const std::string &script, const std::string &sourcePath) override;
 
+    GAny setBreakpoint(const std::string &file, int line, const std::string &condition) override;
+
+    GAny clearBreakpoint(const std::string &file, int line) override;
+
+    GAny clearAllBreakpoints() override;
+
+    GAny listBreakpoints() const override;
+
+    GAny pause() override;
+
+    GAny resume() override;
+
+    GAny stepInto() override;
+
+    GAny stepOver() override;
+
+    GAny stepOut() override;
+
+    GAny setTrapOnBreak(bool enabled) override;
+
+    GAny setInteractiveOnBreak(bool enabled) override;
+
+    GAny setPrintStackOnBreak(bool enabled) override;
+
+    GAny setPauseOnException(bool enabled) override;
+
+    GAny watch(const std::string &expression) override;
+
+    GAny clearWatch(const std::string &expression) override;
+
+    GAny clearAllWatches() override;
+
     GAny getPauseState() const override;
 
 public:

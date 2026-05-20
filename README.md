@@ -172,6 +172,50 @@ const auto js = GAnyJS::threadLocal();
 const GAny pauseState = js->getPauseState();
 ```
 
+The host can also drive the same debugger state machine directly without
+issuing JavaScript `GxDebugger.*` calls:
+
+```cpp
+const auto js = GAnyJS::threadLocal();
+
+js->setTrapOnBreak(false);
+js->setInteractiveOnBreak(false);
+js->setPrintStackOnBreak(true);
+js->setPauseOnException(true);
+
+js->setBreakpoint("examples/js/test.js", 44);
+js->watch("self.a + b");
+js->pause();
+
+const GAny pendingState = js->getPauseState();
+const GAny breakpoints = js->listBreakpoints();
+
+js->resume();
+js->stepInto();
+js->stepOver();
+js->stepOut();
+js->clearWatch("self.a + b");
+js->clearAllWatches();
+js->clearBreakpoint("examples/js/test.js", 44);
+js->clearAllBreakpoints();
+```
+
+Host debugger control methods such as `setBreakpoint()`, `clearBreakpoint()`,
+`clearAllBreakpoints()`, `pause()`, `resume()`, `stepInto()`, `stepOver()`,
+`stepOut()`, `setTrapOnBreak()`, `setInteractiveOnBreak()`,
+`setPrintStackOnBreak()`, `setPauseOnException()`, `watch()`,
+`clearWatch()`, and `clearAllWatches()` return `undefined` on success, or
+`GAnyException` when the runtime/debugger state is invalid or a breakpoint
+location cannot be resolved. `getPauseState()` returns the same snapshot object
+shape described above, and `listBreakpoints()` returns the same array shape as
+JavaScript `GxDebugger.listBreakpoints()`.
+
+When breakpoints run in non-interactive mode with trapping disabled
+(`GxDebugger.setTrapOnBreak(false)` and `interactiveOnBreak == false`), the
+JavaScript thread now remains paused until the host issues `resume()` or one of
+the `step*()` requests. Those wake-up controls may be issued from another host
+thread while the owning JavaScript thread is blocked inside the debugger pause.
+
 In non-interactive break flows, the last pause snapshot remains visible
 through `reason`, `location`, and `step` until a later `resume()` /
 `stepInto()` / `stepOver()` / `stepOut()` / `pause()` request overwrites

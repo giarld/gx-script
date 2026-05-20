@@ -13,6 +13,7 @@
 
 #include "gx/debug.h"
 #include "gx/gfile.h"
+#include "gx/gthread.h"
 
 
 using namespace gany;
@@ -68,6 +69,22 @@ int main(int argc, char *argv[])
 
     const std::string path = GFile(GX_EXAMPLE_DIR).concat("js/test.js").absoluteFilePath();
 
+    // js->setTrapOnBreak(false);
+    // js->setBreakpoint("test.js", 43);
+    //
+    // GThread controller([js] {
+    //     for (;;) {
+    //         const GAny state = js->getPauseState();
+    //
+    //         if (state.isObject() && state["paused"].toBool()) {
+    //             // 也可以改成 js->stepInto() / stepOver() / stepOut()
+    //             js->resume();
+    //             break;
+    //         }
+    //         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    //     }
+    // });
+
     GAny env;
     env["title"] = "TestScriptJS";
 
@@ -79,6 +96,8 @@ int main(int argc, char *argv[])
     }
 
     js->onUpdate();
+
+    // controller.join();
 
     js->gc();
 
