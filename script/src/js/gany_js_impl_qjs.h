@@ -105,6 +105,7 @@ private:
 
     JSRuntime *mJsRuntime;
     JSContext *mJSContext;
+    JS_State *mJSState;
 };
 
 #endif //GX_GANY_JS_IMPL_QJS_H

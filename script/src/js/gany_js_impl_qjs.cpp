@@ -9,6 +9,7 @@
 #include "gx/gfile.h"
 #include "gx/debug.h"
 
+#include <atomic>
 #include <cctype>
 #include <csignal>
 #include <condition_variable>
@@ -75,6 +76,28 @@ struct GxDebuggerSuppressedBreakpoint
     uint32_t pcOffset = 0;
 };
 
+enum GxDebuggerFastFlag : uint32_t
+{
+    GxDebuggerFastFlag_Evaluating = 1u << 0u,
+    GxDebuggerFastFlag_PauseRequested = 1u << 1u,
+    GxDebuggerFastFlag_StepRequested = 1u << 2u,
+    GxDebuggerFastFlag_HasBreakpoints = 1u << 3u,
+    GxDebuggerFastFlag_PauseOnException = 1u << 4u,
+};
+
+struct GxDebuggerPollSnapshot
+{
+    bool evaluatingWatches = false;
+    bool suppressed = false;
+    bool pauseRequested = false;
+    bool pauseOnException = false;
+    bool printStackOnBreak = true;
+    bool interactiveOnBreak = false;
+    bool trapOnBreak = true;
+    GxDebuggerStepKind stepKind = GxDebuggerStepKind::None;
+    GxDebuggerLocation stepOrigin;
+};
+
 struct GAnyModuleExports
 {
     bool valid = false;
@@ -94,6 +117,7 @@ struct GxQjsDebuggerState
     bool interactiveOnBreak = false;
     bool printStackOnBreak = true;
     bool evaluatingWatches = false;
+    std::atomic<uint32_t> fastFlags{0};
     bool paused = false;
     bool livePaused = false;
     GxDebuggerPauseReason pauseReason = GxDebuggerPauseReason::None;
@@ -151,6 +175,7 @@ static bool tryGetBreakpointAt(const GxQjsDebuggerState *state, const std::strin
                                GxDebuggerBreakpoint *breakpointOut);
 static void setDebuggerBreakpoint(GxQjsDebuggerState *state, const std::string &file, int line,
                                   const std::string &condition);
+static bool eraseDebuggerBreakpoint(GxQjsDebuggerState *state, const std::string &file, int line);
 static void clearDebuggerBreakpoint(GxQjsDebuggerState *state, const std::string &file, int line);
 static void clearAllDebuggerBreakpoints(GxQjsDebuggerState *state);
 static void setDebuggerTrapOnBreak(GxQjsDebuggerState *state, bool enabled);
@@ -163,9 +188,11 @@ static void clearAllDebuggerWatches(GxQjsDebuggerState *state);
 static void printBreakpointList(const GxQjsDebuggerState *state);
 static void beginWatchEvaluation(JSContext *ctx, GxQjsDebuggerState *state);
 static void endWatchEvaluation(JSContext *ctx, GxQjsDebuggerState *state);
+static void refreshDebuggerFastFlagsLocked(GxQjsDebuggerState *state);
 static uint32_t computeDebuggerPollMask(const GxQjsDebuggerState *state);
 static GAny buildDebuggerBreakpointListObject(const GxQjsDebuggerState *state);
 static GAny buildDebuggerPauseStateObject(const GxQjsDebuggerState *state);
+static bool isDebuggerLivePaused(const GxQjsDebuggerState *state);
 static void waitForHostDebuggerCommand(GxQjsDebuggerState *state);
 
 static const char *pauseReasonName(GxDebuggerPauseReason reason)
@@ -225,23 +252,6 @@ static void deactivateLivePausedState(GxQjsDebuggerState *state)
     state->livePaused = false;
 }
 
-static void setPausedState(GxQjsDebuggerState *state, GxDebuggerPauseReason reason,
-                           const GxDebuggerLocation &location,
-                           GxDebuggerStepKind stepKind = GxDebuggerStepKind::None,
-                           const GxDebuggerLocation &stepOrigin = {})
-{
-    if (!state) {
-        return;
-    }
-    std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
-    state->paused = true;
-    state->livePaused = true;
-    state->pauseReason = reason;
-    state->pauseLocation = location;
-    state->pauseStepKind = stepKind;
-    state->pauseStepOrigin = stepKind != GxDebuggerStepKind::None ? stepOrigin : GxDebuggerLocation{};
-}
-
 static void updateDebuggerHandler(JSContext *ctx, GxQjsDebuggerState *state)
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
@@ -263,7 +273,7 @@ static JSValue js_gxDebuggerIsPaused(JSContext *ctx, JSValueConst, int, JSValueC
     if (!state) {
         return JS_ThrowInternalError(ctx, "debugger state is not initialized");
     }
-    return JS_NewBool(ctx, state->livePaused);
+    return JS_NewBool(ctx, isDebuggerLivePaused(state));
 }
 
 static JSValue js_gxDebuggerGetPauseState(JSContext *ctx, JSValueConst, int, JSValueConst *)
@@ -495,6 +505,7 @@ static void requestDebuggerPause(GxQjsDebuggerState *state)
     state->resumeRequested = false;
     state->stepKind = GxDebuggerStepKind::None;
     state->stepOrigin = {};
+    refreshDebuggerFastFlagsLocked(state);
     state->controlCondition.notify_all();
 }
 
@@ -519,6 +530,7 @@ static void requestDebuggerResume(GxQjsDebuggerState *state)
     state->resumeRequested = wasLivePaused;
     state->stepKind = GxDebuggerStepKind::None;
     state->stepOrigin = {};
+    refreshDebuggerFastFlagsLocked(state);
     state->controlCondition.notify_all();
 }
 
@@ -547,6 +559,7 @@ static void requestDebuggerStep(GxQjsDebuggerState *state, GxDebuggerStepKind ki
     state->resumeRequested = wasLivePaused;
     state->stepKind = kind;
     state->stepOrigin = origin;
+    refreshDebuggerFastFlagsLocked(state);
     state->controlCondition.notify_all();
 }
 
@@ -809,13 +822,23 @@ static void setDebuggerBreakpoint(GxQjsDebuggerState *state, const std::string &
     std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
     state->breakpoints[{file, line}] = GxDebuggerBreakpoint{condition};
     state->suppressedBreakpoints.clear();
+    refreshDebuggerFastFlagsLocked(state);
+}
+
+static bool eraseDebuggerBreakpoint(GxQjsDebuggerState *state, const std::string &file, int line)
+{
+    std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
+    const bool erased = state->breakpoints.erase({file, line}) > 0;
+    if (erased) {
+        state->suppressedBreakpoints.clear();
+        refreshDebuggerFastFlagsLocked(state);
+    }
+    return erased;
 }
 
 static void clearDebuggerBreakpoint(GxQjsDebuggerState *state, const std::string &file, int line)
 {
-    std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
-    state->breakpoints.erase({file, line});
-    state->suppressedBreakpoints.clear();
+    eraseDebuggerBreakpoint(state, file, line);
 }
 
 static void clearAllDebuggerBreakpoints(GxQjsDebuggerState *state)
@@ -823,6 +846,7 @@ static void clearAllDebuggerBreakpoints(GxQjsDebuggerState *state)
     std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
     state->breakpoints.clear();
     state->suppressedBreakpoints.clear();
+    refreshDebuggerFastFlagsLocked(state);
 }
 
 static void setDebuggerTrapOnBreak(GxQjsDebuggerState *state, bool enabled)
@@ -847,6 +871,7 @@ static void setDebuggerPauseOnException(GxQjsDebuggerState *state, bool enabled)
 {
     std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
     state->pauseOnException = enabled;
+    refreshDebuggerFastFlagsLocked(state);
 }
 
 static void addDebuggerWatch(GxQjsDebuggerState *state, const std::string &expression)
@@ -954,7 +979,7 @@ static bool removeBreakpointBySpec(JSContext *ctx, GxQjsDebuggerState *state, co
         const auto breakpoints = collectBreakpointViews(state);
         if (id >= 1 && static_cast<size_t>(id) <= breakpoints.size()) {
             const auto &breakpoint = breakpoints[static_cast<size_t>(id) - 1];
-            return state->breakpoints.erase({breakpoint.file, breakpoint.line}) > 0;
+            return eraseDebuggerBreakpoint(state, breakpoint.file, breakpoint.line);
         }
     }
 
@@ -963,7 +988,7 @@ static bool removeBreakpointBySpec(JSContext *ctx, GxQjsDebuggerState *state, co
     if (!parseBreakpointSpec(ctx, spec, currentFile, &file, &line)) {
         return false;
     }
-    return state->breakpoints.erase({file, line}) > 0;
+    return eraseDebuggerBreakpoint(state, file, line);
 }
 
 static void printBreakpointList(const GxQjsDebuggerState *state)
@@ -984,18 +1009,35 @@ static void printBreakpointList(const GxQjsDebuggerState *state)
     }
 }
 
+static void refreshDebuggerFastFlagsLocked(GxQjsDebuggerState *state)
+{
+    uint32_t flags = 0;
+    if (state->evaluatingWatches) {
+        flags |= GxDebuggerFastFlag_Evaluating;
+    }
+    if (state->pauseRequested) {
+        flags |= GxDebuggerFastFlag_PauseRequested;
+    }
+    if (state->stepKind != GxDebuggerStepKind::None) {
+        flags |= GxDebuggerFastFlag_StepRequested;
+    }
+    if (!state->breakpoints.empty()) {
+        flags |= GxDebuggerFastFlag_HasBreakpoints;
+    }
+    if (state->pauseOnException) {
+        flags |= GxDebuggerFastFlag_PauseOnException;
+    }
+    state->fastFlags.store(flags, std::memory_order_release);
+}
+
 static uint32_t computeDebuggerPollMask(const GxQjsDebuggerState *state)
 {
     if (!state) {
         return JS_DEBUGGER_POLL_MASK_NONE;
     }
 
-    std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
-    uint32_t pollMask = JS_DEBUGGER_POLL_MASK_NONE;
-    if (state->pauseRequested || state->stepKind != GxDebuggerStepKind::None || !state->breakpoints.empty()) {
-        pollMask |= JS_DEBUGGER_POLL_MASK_OPCODE | JS_DEBUGGER_POLL_MASK_CALL;
-    }
-    if (state->pauseOnException) {
+    uint32_t pollMask = JS_DEBUGGER_POLL_MASK_OPCODE | JS_DEBUGGER_POLL_MASK_CALL;
+    if (state->fastFlags.load(std::memory_order_acquire) & GxDebuggerFastFlag_PauseOnException) {
         pollMask |= JS_DEBUGGER_POLL_MASK_EXCEPTION;
     }
     return pollMask;
@@ -1095,14 +1137,22 @@ static void printBreakpointConditionException(JSContext *ctx, const std::string 
 
 static void beginWatchEvaluation(JSContext *ctx, GxQjsDebuggerState *state)
 {
-    state->evaluatingWatches = true;
+    {
+        std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
+        state->evaluatingWatches = true;
+        refreshDebuggerFastFlagsLocked(state);
+    }
     JS_SetDebuggerHandler(JS_GetRuntime(ctx), nullptr, nullptr);
     JS_SetDebuggerStatementHandler(JS_GetRuntime(ctx), nullptr, nullptr);
 }
 
 static void endWatchEvaluation(JSContext *ctx, GxQjsDebuggerState *state)
 {
-    state->evaluatingWatches = false;
+    {
+        std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
+        state->evaluatingWatches = false;
+        refreshDebuggerFastFlagsLocked(state);
+    }
     updateDebuggerHandler(ctx, state);
 }
 
@@ -1306,6 +1356,15 @@ static GAny buildDebuggerPauseStateObject(const GxQjsDebuggerState *state)
     return obj;
 }
 
+static bool isDebuggerLivePaused(const GxQjsDebuggerState *state)
+{
+    if (!state) {
+        return false;
+    }
+    std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
+    return state->livePaused;
+}
+
 static GxDebuggerLocation makeDebuggerLocation(const std::string &file, int lineNum, int colNum,
                                                uint64_t frameId, uint32_t frameDepth, uint32_t pcOffset,
                                                JSDebuggerPollKind pollKind)
@@ -1328,33 +1387,83 @@ static bool sameDebuggerSourceLocation(const GxDebuggerLocation &lhs, const GxDe
            && lhs.line == rhs.line && lhs.col == rhs.col;
 }
 
-static bool shouldStopForStep(GxQjsDebuggerState *state, const GxDebuggerLocation &current)
+static bool shouldStopForStep(GxDebuggerStepKind stepKind, const GxDebuggerLocation &stepOrigin,
+                              const GxDebuggerLocation &current)
 {
-    std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
-    if (state->stepKind == GxDebuggerStepKind::None || !current.valid) {
+    if (stepKind == GxDebuggerStepKind::None || !current.valid) {
         return false;
     }
-    if (!state->stepOrigin.valid) {
+    if (!stepOrigin.valid) {
         return true;
     }
-    if (sameDebuggerSourceLocation(current, state->stepOrigin)) {
+    if (sameDebuggerSourceLocation(current, stepOrigin)) {
         return false;
     }
 
-    switch (state->stepKind) {
+    switch (stepKind) {
     case GxDebuggerStepKind::Into:
         return true;
     case GxDebuggerStepKind::Over:
-        if (current.frameDepth > state->stepOrigin.frameDepth) {
+        if (current.frameDepth > stepOrigin.frameDepth) {
             return false;
         }
         return true;
     case GxDebuggerStepKind::Out:
-        return current.frameDepth < state->stepOrigin.frameDepth;
+        return current.frameDepth < stepOrigin.frameDepth;
     case GxDebuggerStepKind::None:
         break;
     }
     return false;
+}
+
+static GxDebuggerPollSnapshot makeDebuggerPollSnapshot(GxQjsDebuggerState *state,
+                                                       const GxDebuggerLocation &current)
+{
+    GxDebuggerPollSnapshot snapshot;
+    if (!state) {
+        return snapshot;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
+    snapshot.evaluatingWatches = state->evaluatingWatches;
+    snapshot.pauseRequested = state->pauseRequested;
+    snapshot.pauseOnException = state->pauseOnException;
+    snapshot.printStackOnBreak = state->printStackOnBreak;
+    snapshot.interactiveOnBreak = state->interactiveOnBreak;
+    snapshot.trapOnBreak = state->trapOnBreak;
+    snapshot.stepKind = state->stepKind;
+    snapshot.stepOrigin = state->stepOrigin;
+
+    auto suppressedIt = state->suppressedBreakpoints.find(current.frameId);
+    if (suppressedIt != state->suppressedBreakpoints.end()
+        && (suppressedIt->second.file != current.file || suppressedIt->second.line != current.line
+            || current.pcOffset < suppressedIt->second.pcOffset)) {
+        state->suppressedBreakpoints.erase(suppressedIt);
+        suppressedIt = state->suppressedBreakpoints.end();
+    }
+    snapshot.suppressed = suppressedIt != state->suppressedBreakpoints.end();
+    return snapshot;
+}
+
+static void markDebuggerPaused(GxQjsDebuggerState *state, const GxDebuggerLocation &current,
+                               GxDebuggerPauseReason pauseReason, bool breakpointPause,
+                               GxDebuggerStepKind pauseStepKind,
+                               const GxDebuggerLocation &pauseStepOrigin)
+{
+    std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
+    state->pauseRequested = false;
+    state->stepKind = GxDebuggerStepKind::None;
+    state->stepOrigin = {};
+    state->paused = true;
+    state->livePaused = true;
+    state->pauseReason = pauseReason;
+    state->pauseLocation = current;
+    state->pauseStepKind = pauseStepKind;
+    state->pauseStepOrigin = pauseStepKind != GxDebuggerStepKind::None ? pauseStepOrigin : GxDebuggerLocation{};
+    if (breakpointPause) {
+        state->suppressedBreakpoints[current.frameId] = {current.file, current.line, current.pcOffset};
+    }
+    refreshDebuggerFastFlagsLocked(state);
 }
 
 static void requestDebuggerStepFromLocation(GxQjsDebuggerState *state, GxDebuggerStepKind kind,
@@ -1365,6 +1474,7 @@ static void requestDebuggerStepFromLocation(GxQjsDebuggerState *state, GxDebugge
     state->resumeRequested = true;
     state->stepKind = kind;
     state->stepOrigin = origin;
+    refreshDebuggerFastFlagsLocked(state);
     state->controlCondition.notify_all();
     std::fprintf(stderr, "[GxDebugger] %s\n", stepKindName(kind));
 }
@@ -1374,6 +1484,7 @@ static void clearDebuggerStep(GxQjsDebuggerState *state)
     std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
     state->stepKind = GxDebuggerStepKind::None;
     state->stepOrigin = {};
+    refreshDebuggerFastFlagsLocked(state);
 }
 
 static void waitForHostDebuggerCommand(GxQjsDebuggerState *state)
@@ -1385,6 +1496,7 @@ static void waitForHostDebuggerCommand(GxQjsDebuggerState *state)
     state->controlCondition.wait(lock, [state] {
         return state->resumeRequested || state->stepKind != GxDebuggerStepKind::None;
     });
+    state->resumeRequested = false;
 }
 
 static bool printWatchesWithLazyLocals(JSContext *ctx, GxQjsDebuggerState *state,
@@ -1539,13 +1651,22 @@ static bool runInteractiveDebugger(JSContext *ctx, GxQjsDebuggerState *state,
                  "[GxDebugger] interactive mode. Type h or help for commands.\n");
 
     char input[2048];
-    while (!state->resumeRequested) {
+    for (;;) {
+        {
+            std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
+            if (state->resumeRequested) {
+                break;
+            }
+        }
         flushDebuggerOutput();
         std::fprintf(stderr, "(gxdbg) ");
         std::fflush(stderr);
 
         if (!std::fgets(input, sizeof(input), stdin)) {
-            state->resumeRequested = true;
+            {
+                std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
+                state->resumeRequested = true;
+            }
             clearDebuggerStep(state);
             break;
         }
@@ -1557,9 +1678,13 @@ static bool runInteractiveDebugger(JSContext *ctx, GxQjsDebuggerState *state,
         if (command == "c" || command == "continue" || command == "resume") {
             GxDebuggerBreakpoint breakpoint;
             if (tryGetBreakpointAt(state, current.file, current.line, &breakpoint)) {
+                std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
                 state->suppressedBreakpoints[current.frameId] = {current.file, current.line, current.pcOffset};
             }
-            state->resumeRequested = true;
+            {
+                std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
+                state->resumeRequested = true;
+            }
             clearDebuggerStep(state);
             break;
         }
@@ -1598,8 +1723,7 @@ static bool runInteractiveDebugger(JSContext *ctx, GxQjsDebuggerState *state,
                 || !parseBreakpointSpec(ctx, location, &current.file, &file, &line)) {
                 std::fprintf(stderr, "[GxDebugger] breakpoint expects <file>:<line> [if <expr>]\n");
             } else {
-                state->breakpoints[{file, line}] = GxDebuggerBreakpoint{condition};
-                state->suppressedBreakpoints.clear();
+                setDebuggerBreakpoint(state, file, line, condition);
                 updateDebuggerHandler(ctx, state);
                 size_t breakpointId = 0;
                 for (const auto &breakpoint: collectBreakpointViews(state)) {
@@ -1633,7 +1757,6 @@ static bool runInteractiveDebugger(JSContext *ctx, GxQjsDebuggerState *state,
             } else if (!removeBreakpointBySpec(ctx, state, spec, &current.file)) {
                 std::fprintf(stderr, "[GxDebugger] breakpoint not found: %s\n", spec.c_str());
             } else {
-                state->suppressedBreakpoints.clear();
                 updateDebuggerHandler(ctx, state);
                 std::fprintf(stderr, "[GxDebugger] breakpoint removed: %s\n", spec.c_str());
             }
@@ -1644,7 +1767,10 @@ static bool runInteractiveDebugger(JSContext *ctx, GxQjsDebuggerState *state,
             continue;
         }
         if (command == "q" || command == "quit") {
-            state->resumeRequested = false;
+            {
+                std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
+                state->resumeRequested = false;
+            }
             clearDebuggerStep(state);
             return false;
         }
@@ -1666,7 +1792,10 @@ static bool runInteractiveDebugger(JSContext *ctx, GxQjsDebuggerState *state,
         std::fprintf(stderr, "[GxDebugger] unknown command: %s\n", command.c_str());
     }
 
-    state->resumeRequested = false;
+    {
+        std::lock_guard<std::recursive_mutex> lock(state->syncMutex);
+        state->resumeRequested = false;
+    }
     return true;
 }
 
@@ -1679,29 +1808,39 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
     if (!state || lineNum <= 0) {
         return 0;
     }
-    if (state->evaluatingWatches) {
+
+    const uint32_t fastFlags = state->fastFlags.load(std::memory_order_acquire);
+    if (fastFlags & GxDebuggerFastFlag_Evaluating) {
         return 0;
+    }
+    if (pollKind == JS_DEBUGGER_POLL_EXCEPTION) {
+        if (!(fastFlags & GxDebuggerFastFlag_PauseOnException)) {
+            return 0;
+        }
+    } else if (pollKind != JS_DEBUGGER_POLL_DEBUGGER) {
+        constexpr uint32_t stoppableFlags = GxDebuggerFastFlag_PauseRequested
+                                            | GxDebuggerFastFlag_StepRequested
+                                            | GxDebuggerFastFlag_HasBreakpoints;
+        if (!(fastFlags & stoppableFlags)) {
+            return 0;
+        }
     }
 
     const std::string file = filename ? filename : "<anonymous>";
     const GxDebuggerLocation current = makeDebuggerLocation(file, lineNum, colNum, frameId, frameDepth, pcOffset,
                                                             pollKind);
-    auto suppressedIt = state->suppressedBreakpoints.find(frameId);
-    if (suppressedIt != state->suppressedBreakpoints.end()
-        && (suppressedIt->second.file != file || suppressedIt->second.line != lineNum
-            || pcOffset < suppressedIt->second.pcOffset)) {
-        state->suppressedBreakpoints.erase(suppressedIt);
-        suppressedIt = state->suppressedBreakpoints.end();
+    const GxDebuggerPollSnapshot snapshot = makeDebuggerPollSnapshot(state, current);
+    if (snapshot.evaluatingWatches) {
+        return 0;
     }
 
-    const bool suppressed = suppressedIt != state->suppressedBreakpoints.end();
-    const bool pauseHit = state->pauseRequested;
-    const bool stepHit = shouldStopForStep(state, current);
-    const bool exceptionHit = pollKind == JS_DEBUGGER_POLL_EXCEPTION && state->pauseOnException;
+    const bool pauseHit = snapshot.pauseRequested;
+    const bool stepHit = shouldStopForStep(snapshot.stepKind, snapshot.stepOrigin, current);
+    const bool exceptionHit = pollKind == JS_DEBUGGER_POLL_EXCEPTION && snapshot.pauseOnException;
     const bool debuggerStatementHit = pollKind == JS_DEBUGGER_POLL_DEBUGGER;
     GxDebuggerBreakpoint breakpoint;
     const bool breakpointConfigured = tryGetBreakpointAt(state, file, lineNum, &breakpoint);
-    bool breakpointPause = breakpointConfigured && !suppressed && !pauseHit && !stepHit;
+    bool breakpointPause = breakpointConfigured && !snapshot.suppressed && !pauseHit && !stepHit;
     if (breakpointPause) {
         breakpointPause = shouldPauseForBreakpointCondition(ctx, state, &breakpoint, getLocals, getLocalsOpaque);
         if (!breakpointPause) {
@@ -1723,15 +1862,9 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
         pauseReason = GxDebuggerPauseReason::Step;
     }
 
-    const GxDebuggerStepKind pauseStepKind = stepHit ? state->stepKind : GxDebuggerStepKind::None;
-    const GxDebuggerLocation pauseStepOrigin = stepHit ? state->stepOrigin : GxDebuggerLocation{};
-
-    state->pauseRequested = false;
-    clearDebuggerStep(state);
-    setPausedState(state, pauseReason, current, pauseStepKind, pauseStepOrigin);
-    if (breakpointPause) {
-        state->suppressedBreakpoints[frameId] = {file, lineNum, pcOffset};
-    }
+    const GxDebuggerStepKind pauseStepKind = stepHit ? snapshot.stepKind : GxDebuggerStepKind::None;
+    const GxDebuggerLocation pauseStepOrigin = stepHit ? snapshot.stepOrigin : GxDebuggerLocation{};
+    markDebuggerPaused(state, current, pauseReason, breakpointPause, pauseStepKind, pauseStepOrigin);
 
     if (exceptionHit) {
         std::fprintf(stderr, "[GxDebugger] paused on exception at %s:%d:%d\n", file.c_str(), lineNum, colNum);
@@ -1741,13 +1874,13 @@ static int gxQjsDebuggerPoll(JSContext *ctx, const char *filename, int lineNum, 
     } else {
         std::fprintf(stderr, "[GxDebugger] paused at %s:%d:%d\n", file.c_str(), lineNum, colNum);
     }
-    if (state->printStackOnBreak) {
+    if (snapshot.printStackOnBreak) {
         printCurrentJsStack(ctx, state, &current);
     }
     printWatchesWithLazyLocals(ctx, state, getLocals, getLocalsOpaque);
 
-    const bool interactiveOnBreak = state->interactiveOnBreak;
-    const bool trapOnBreak = state->trapOnBreak;
+    const bool interactiveOnBreak = snapshot.interactiveOnBreak;
+    const bool trapOnBreak = snapshot.trapOnBreak;
     if (interactiveOnBreak) {
         if (!runInteractiveDebugger(ctx, state, getLocals, getLocalsOpaque, current)) {
             clearPausedState(state);
@@ -2133,6 +2266,9 @@ void GAnyJS::setExceptionHandler(ExceptionHandler handler)
 }
 
 GAnyJSImplQjs::GAnyJSImplQjs()
+    : mJsRuntime(nullptr),
+      mJSContext(nullptr),
+      mJSState(nullptr)
 {
     init();
 }
@@ -2397,8 +2533,10 @@ GAny GAnyJSImplQjs::setBreakpoint(const std::string &file, int line, const std::
     CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
     CHECK_CONDITION_R(line > 0, GAnyException("breakpoint line must be positive"));
 
-    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
+    CHECK_CONDITION_R(isDebuggerOwnerThread(jsState),
+                      GAnyException("setBreakpoint must be called from the JS owning thread"));
 
     GxQjsDebuggerState *state = getDebuggerState(jsState);
     CHECK_CONDITION_R(state != nullptr, GAnyException("debugger state is not initialized"));
@@ -2418,8 +2556,10 @@ GAny GAnyJSImplQjs::clearBreakpoint(const std::string &file, int line)
     CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
     CHECK_CONDITION_R(line > 0, GAnyException("breakpoint line must be positive"));
 
-    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
+    CHECK_CONDITION_R(isDebuggerOwnerThread(jsState),
+                      GAnyException("clearBreakpoint must be called from the JS owning thread"));
 
     GxQjsDebuggerState *state = getDebuggerState(jsState);
     CHECK_CONDITION_R(state != nullptr, GAnyException("debugger state is not initialized"));
@@ -2438,8 +2578,10 @@ GAny GAnyJSImplQjs::clearAllBreakpoints()
 {
     CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
 
-    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
+    CHECK_CONDITION_R(isDebuggerOwnerThread(jsState),
+                      GAnyException("clearAllBreakpoints must be called from the JS owning thread"));
 
     GxQjsDebuggerState *state = getDebuggerState(jsState);
     CHECK_CONDITION_R(state != nullptr, GAnyException("debugger state is not initialized"));
@@ -2451,9 +2593,9 @@ GAny GAnyJSImplQjs::clearAllBreakpoints()
 
 GAny GAnyJSImplQjs::listBreakpoints() const
 {
-    CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
+    CHECK_CONDITION_R(mJSState != nullptr, GAnyException("JS state not initialized"));
 
-    const JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    const JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
 
     return buildDebuggerBreakpointListObject(getDebuggerState(jsState));
@@ -2461,24 +2603,26 @@ GAny GAnyJSImplQjs::listBreakpoints() const
 
 GAny GAnyJSImplQjs::pause()
 {
-    CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
+    CHECK_CONDITION_R(mJSState != nullptr, GAnyException("JS state not initialized"));
 
-    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
 
     GxQjsDebuggerState *state = getDebuggerState(jsState);
     CHECK_CONDITION_R(state != nullptr, GAnyException("debugger state is not initialized"));
 
     requestDebuggerPause(state);
-    updateDebuggerHandler(mJSContext, state);
+    if (isDebuggerOwnerThread(jsState) && mJSContext) {
+        updateDebuggerHandler(mJSContext, state);
+    }
     return GAny::undefined();
 }
 
 GAny GAnyJSImplQjs::resume()
 {
-    CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
+    CHECK_CONDITION_R(mJSState != nullptr, GAnyException("JS state not initialized"));
 
-    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
 
     GxQjsDebuggerState *state = getDebuggerState(jsState);
@@ -2501,9 +2645,9 @@ GAny GAnyJSImplQjs::resume()
 
 GAny GAnyJSImplQjs::stepInto()
 {
-    CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
+    CHECK_CONDITION_R(mJSState != nullptr, GAnyException("JS state not initialized"));
 
-    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
 
     GxQjsDebuggerState *state = getDebuggerState(jsState);
@@ -2526,9 +2670,9 @@ GAny GAnyJSImplQjs::stepInto()
 
 GAny GAnyJSImplQjs::stepOver()
 {
-    CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
+    CHECK_CONDITION_R(mJSState != nullptr, GAnyException("JS state not initialized"));
 
-    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
 
     GxQjsDebuggerState *state = getDebuggerState(jsState);
@@ -2551,9 +2695,9 @@ GAny GAnyJSImplQjs::stepOver()
 
 GAny GAnyJSImplQjs::stepOut()
 {
-    CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
+    CHECK_CONDITION_R(mJSState != nullptr, GAnyException("JS state not initialized"));
 
-    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
 
     GxQjsDebuggerState *state = getDebuggerState(jsState);
@@ -2576,9 +2720,9 @@ GAny GAnyJSImplQjs::stepOut()
 
 GAny GAnyJSImplQjs::setTrapOnBreak(bool enabled)
 {
-    CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
+    CHECK_CONDITION_R(mJSState != nullptr, GAnyException("JS state not initialized"));
 
-    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
 
     GxQjsDebuggerState *state = getDebuggerState(jsState);
@@ -2590,9 +2734,9 @@ GAny GAnyJSImplQjs::setTrapOnBreak(bool enabled)
 
 GAny GAnyJSImplQjs::setInteractiveOnBreak(bool enabled)
 {
-    CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
+    CHECK_CONDITION_R(mJSState != nullptr, GAnyException("JS state not initialized"));
 
-    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
 
     GxQjsDebuggerState *state = getDebuggerState(jsState);
@@ -2604,9 +2748,9 @@ GAny GAnyJSImplQjs::setInteractiveOnBreak(bool enabled)
 
 GAny GAnyJSImplQjs::setPrintStackOnBreak(bool enabled)
 {
-    CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
+    CHECK_CONDITION_R(mJSState != nullptr, GAnyException("JS state not initialized"));
 
-    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
 
     GxQjsDebuggerState *state = getDebuggerState(jsState);
@@ -2620,7 +2764,7 @@ GAny GAnyJSImplQjs::setPauseOnException(bool enabled)
 {
     CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
 
-    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
     CHECK_CONDITION_R(isDebuggerOwnerThread(jsState),
                       GAnyException("setPauseOnException must be called from the JS owning thread"));
@@ -2635,9 +2779,9 @@ GAny GAnyJSImplQjs::setPauseOnException(bool enabled)
 
 GAny GAnyJSImplQjs::watch(const std::string &expression)
 {
-    CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
+    CHECK_CONDITION_R(mJSState != nullptr, GAnyException("JS state not initialized"));
 
-    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
 
     GxQjsDebuggerState *state = getDebuggerState(jsState);
@@ -2649,9 +2793,9 @@ GAny GAnyJSImplQjs::watch(const std::string &expression)
 
 GAny GAnyJSImplQjs::clearWatch(const std::string &expression)
 {
-    CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
+    CHECK_CONDITION_R(mJSState != nullptr, GAnyException("JS state not initialized"));
 
-    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
 
     GxQjsDebuggerState *state = getDebuggerState(jsState);
@@ -2663,9 +2807,9 @@ GAny GAnyJSImplQjs::clearWatch(const std::string &expression)
 
 GAny GAnyJSImplQjs::clearAllWatches()
 {
-    CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
+    CHECK_CONDITION_R(mJSState != nullptr, GAnyException("JS state not initialized"));
 
-    JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
 
     GxQjsDebuggerState *state = getDebuggerState(jsState);
@@ -2679,9 +2823,9 @@ GAny GAnyJSImplQjs::clearAllWatches()
 
 GAny GAnyJSImplQjs::getPauseState() const
 {
-    CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
+    CHECK_CONDITION_R(mJSState != nullptr, GAnyException("JS state not initialized"));
 
-    const JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    const JS_State *jsState = mJSState;
     CHECK_CONDITION_R(jsState != nullptr, GAnyException("JS state not initialized"));
 
     return buildDebuggerPauseStateObject(getDebuggerState(jsState));
@@ -2691,9 +2835,9 @@ GAny GAnyJSImplQjs::getPauseState() const
 
 const JS_State * GAnyJSImplQjs::getJSState() const
 {
-    CHECK_CONDITION_R(mJSContext != nullptr, nullptr);
+    CHECK_CONDITION_R(mJSState != nullptr, nullptr);
 
-    return static_cast<JS_State *>(JS_GetContextOpaque(mJSContext));
+    return mJSState;
 }
 
 JSModuleDef *GAnyJSImplQjs::JS_moduleLoader(JSContext *ctx, const char *moduleName, void *)
@@ -2779,6 +2923,7 @@ void GAnyJSImplQjs::init()
     JS_SetHostPromiseRejectionTracker(mJsRuntime, js_std_promise_rejection_tracker, nullptr);
 
     mJSContext = JS_NewCustomContext(mJsRuntime);
+    mJSState = mJSContext ? static_cast<JS_State *>(JS_GetContextOpaque(mJSContext)) : nullptr;
 }
 
 void GAnyJSImplQjs::shutdownImpl()
@@ -2787,10 +2932,9 @@ void GAnyJSImplQjs::shutdownImpl()
         JSRuntime *rt = mJsRuntime;
         JSContext *ctx = mJSContext;
 
-        JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
         // 可能存在 Js 中 Export 类型的情况, 则需要在此处先进行反注册, jsState 释放会在 jsStateObjectFinalizer 中完成.
         // 异步 Worker 不被允许 Export 所以无需担心.
-        GAnyToQJS::releaseJS(jsState);
+        GAnyToQJS::releaseJS(mJSState);
 
         JS_RunGC(mJsRuntime);
 
@@ -2800,5 +2944,7 @@ void GAnyJSImplQjs::shutdownImpl()
         JS_FreeRuntime(rt);
 
         mJsRuntime = nullptr;
+        mJSContext = nullptr;
+        mJSState = nullptr;
     }
 }

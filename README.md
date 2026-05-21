@@ -210,6 +210,13 @@ location cannot be resolved. `getPauseState()` returns the same snapshot object
 shape described above, and `listBreakpoints()` returns the same array shape as
 JavaScript `GxDebugger.listBreakpoints()`.
 
+Host methods that resolve source locations or update QuickJS exception polling,
+including `setBreakpoint()`, `clearBreakpoint()`, `clearAllBreakpoints()`,
+and `setPauseOnException()`, must be called from the JavaScript owning thread.
+`pause()` may be issued from another host thread to request the next
+stoppable JavaScript location. Cross-thread wake-up is limited to `resume()`
+and `step*()` while the owning thread is blocked in a non-interactive pause.
+
 When breakpoints run in non-interactive mode with trapping disabled
 (`GxDebugger.setTrapOnBreak(false)` and `interactiveOnBreak == false`), the
 JavaScript thread now remains paused until the host issues `resume()` or one of

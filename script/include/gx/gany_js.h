@@ -55,6 +55,7 @@ public:
 
     /**
      * 设置一个源码行断点。
+     * 必须从 JS owning thread 调用。
      * @param file      绝对路径、路径后缀，或 "." 表示当前暂停/执行中的源码文件
      * @param line      1-based 源码行号
      * @param condition 可选断点条件，truthy 时暂停
@@ -64,6 +65,7 @@ public:
 
     /**
      * 清除一个源码行断点。
+     * 必须从 JS owning thread 调用。
      * @param file 绝对路径、路径后缀，或 "." 表示当前暂停/执行中的源码文件
      * @param line 1-based 源码行号
      * @return 成功返回 undefined，失败返回 GAnyException
@@ -72,6 +74,7 @@ public:
 
     /**
      * 清除当前运行时中的全部断点。
+     * 必须从 JS owning thread 调用。
      * @return 成功返回 undefined，失败返回 GAnyException
      */
     virtual GAny clearAllBreakpoints() = 0;
@@ -84,30 +87,35 @@ public:
 
     /**
      * 请求在下一次可停 JS 字节码位置暂停。
+     * 可从宿主控制线程调用。
      * @return 成功返回 undefined，失败返回 GAnyException
      */
     virtual GAny pause() = 0;
 
     /**
      * 从 debugger 暂停状态继续执行。
+     * 非交互暂停阻塞时，允许从宿主控制线程调用。
      * @return 成功返回 undefined，失败返回 GAnyException
      */
     virtual GAny resume() = 0;
 
     /**
      * 单步进入。
+     * 非交互暂停阻塞时，允许从宿主控制线程调用。
      * @return 成功返回 undefined，失败返回 GAnyException
      */
     virtual GAny stepInto() = 0;
 
     /**
      * 单步越过。
+     * 非交互暂停阻塞时，允许从宿主控制线程调用。
      * @return 成功返回 undefined，失败返回 GAnyException
      */
     virtual GAny stepOver() = 0;
 
     /**
      * 单步跳出当前 JS 函数。
+     * 非交互暂停阻塞时，允许从宿主控制线程调用。
      * @return 成功返回 undefined，失败返回 GAnyException
      */
     virtual GAny stepOut() = 0;
@@ -132,6 +140,7 @@ public:
 
     /**
      * 设置运行时 JS 异常抛出时是否暂停。
+     * 必须从 JS owning thread 调用。
      * @return 成功返回 undefined，失败返回 GAnyException
      */
     virtual GAny setPauseOnException(bool enabled = true) = 0;

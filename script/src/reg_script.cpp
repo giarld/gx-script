@@ -187,6 +187,7 @@ REGISTER_GANY_MODULE(GxScript)
         .staticFunc("threadLocal", GAnyJS::threadLocal)
         .staticFunc("setFileReader", &GAnyJS::setFileReader)
         .staticFunc("setModuleNameNormalizeFunc", &GAnyJS::setModuleNameNormalizeFunc)
+        .staticFunc("setExceptionHandler", &GAnyJS::setExceptionHandler)
         .func("shutdown", &GAnyJS::shutdown)
         .func("gc", &GAnyJS::gc)
         .func("onUpdate", &GAnyJS::onUpdate)
@@ -209,5 +210,46 @@ REGISTER_GANY_MODULE(GxScript)
             return self.evalFile(filePath);
         })
         .func("compile", &GAnyJS::compile)
+        .func("setBreakpoint", [](GAnyJS &self, const std::string &file, int line, const std::string &condition) {
+            return self.setBreakpoint(file, line, condition);
+        })
+        .func("setBreakpoint", [](GAnyJS &self, const std::string &file, int line) {
+            return self.setBreakpoint(file, line);
+        })
+        .func("clearBreakpoint", &GAnyJS::clearBreakpoint)
+        .func("clearAllBreakpoints", &GAnyJS::clearAllBreakpoints)
+        .func("listBreakpoints", &GAnyJS::listBreakpoints)
+        .func("pause", &GAnyJS::pause)
+        .func("resume", &GAnyJS::resume)
+        .func("stepInto", &GAnyJS::stepInto)
+        .func("stepOver", &GAnyJS::stepOver)
+        .func("stepOut", &GAnyJS::stepOut)
+        .func("setTrapOnBreak", [](GAnyJS &self, bool enabled) {
+            return self.setTrapOnBreak(enabled);
+        })
+        .func("setTrapOnBreak", [](GAnyJS &self) {
+            return self.setTrapOnBreak();
+        })
+        .func("setInteractiveOnBreak", [](GAnyJS &self, bool enabled) {
+            return self.setInteractiveOnBreak(enabled);
+        })
+        .func("setInteractiveOnBreak", [](GAnyJS &self) {
+            return self.setInteractiveOnBreak();
+        })
+        .func("setPrintStackOnBreak", [](GAnyJS &self, bool enabled) {
+            return self.setPrintStackOnBreak(enabled);
+        })
+        .func("setPrintStackOnBreak", [](GAnyJS &self) {
+            return self.setPrintStackOnBreak();
+        })
+        .func("setPauseOnException", [](GAnyJS &self, bool enabled) {
+            return self.setPauseOnException(enabled);
+        })
+        .func("setPauseOnException", [](GAnyJS &self) {
+            return self.setPauseOnException();
+        })
+        .func("watch", &GAnyJS::watch)
+        .func("clearWatch", &GAnyJS::clearWatch)
+        .func("clearAllWatches", &GAnyJS::clearAllWatches)
         .func("getPauseState", &GAnyJS::getPauseState);
 }
