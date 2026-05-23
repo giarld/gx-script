@@ -175,7 +175,7 @@ GAny GAnyLuaImpl::evalFile(const std::string &filePath, const GAny &env)
         return loadScriptFromBuffer(buffer, "@" + filePath, env);
     }
 
-    return GAny::undefined();
+    return GAnyException("Failed to read file");
 }
 
 GAny GAnyLuaImpl::evalBuffer(const GByteArray &buffer, std::string sourcePath, const GAny &env)
