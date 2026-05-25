@@ -2037,6 +2037,16 @@ static bool shouldEvalAsJsModule(const std::string &script, const std::string &s
     return path.toLower().endWith(".mjs") || hasJsModuleSyntax(script);
 }
 
+constexpr uint8_t GxBytecodeHeaderMagic[] = {'G', 'X', 'B', 'C'};
+constexpr int GxBytecodeHeaderSize = 5;
+constexpr uint8_t GxBytecodeFlagModule = 1u << 0u;
+
+static bool isGxBytecode(const GByteArray &bytes)
+{
+    return bytes.size() >= GxBytecodeHeaderSize
+           && memcmp(bytes.data(), GxBytecodeHeaderMagic, 4) == 0;
+}
+
 static GAnyModuleExports getGAnyModuleExports(const std::string &moduleName)
 {
     GAnyModuleExports exports;
@@ -2429,15 +2439,78 @@ GAny GAnyJSImplQjs::evalByteCode(const GByteArray &bytes, const GAny &env)
     JSContext *ctx = mJSContext;
     const JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
 
-    const JSValue bytecodeFunc = JS_ReadObject(ctx, bytes.data(), bytes.size(), JS_READ_OBJ_BYTECODE);
+    bool isModule = false;
+    const uint8_t *bytecodeData = bytes.data();
+    size_t bytecodeSize = static_cast<size_t>(bytes.size());
 
-    if (JS_IsException(bytecodeFunc)) {
-        GAny e = GAnyToQJS::makeJsValueToGAny(jsState, bytecodeFunc);
-        JS_FreeValue(ctx, bytecodeFunc);
+    if (isGxBytecode(bytes)) {
+        uint8_t flags = 0;
+        memcpy(&flags, bytes.data() + 4, 1);
+        isModule = (flags & GxBytecodeFlagModule) != 0;
+        bytecodeData += GxBytecodeHeaderSize;
+        bytecodeSize -= GxBytecodeHeaderSize;
+    }
+
+    const JSValue bytecodeObj = JS_ReadObject(ctx, bytecodeData, bytecodeSize, JS_READ_OBJ_BYTECODE);
+
+    if (JS_IsException(bytecodeObj)) {
+        GAny e = GAnyToQJS::makeJsValueToGAny(jsState, bytecodeObj);
+        JS_FreeValue(ctx, bytecodeObj);
         return e;
     }
 
-    const JSValue funcObj = JS_EvalFunction(ctx, bytecodeFunc);
+    if (isModule) {
+        GAny envObj;
+        if (env.isObject()) {
+            envObj = env;
+        } else {
+            envObj = GAny::object();
+        }
+
+        const JSValue global = JS_GetGlobalObject(ctx);
+        const JSAtom envAtom = JS_NewAtom(ctx, "Env");
+        const int hasOldEnv = JS_HasProperty(ctx, global, envAtom);
+        JSValue oldEnv = JS_UNDEFINED;
+        if (hasOldEnv > 0) {
+            oldEnv = JS_GetProperty(ctx, global, envAtom);
+        }
+
+        JS_SetProperty(ctx, global, envAtom, GAnyToQJS::makeGAnyToJsValue(jsState, envObj, true));
+
+        if (js_module_set_import_meta(ctx, bytecodeObj, false, false) < 0) {
+            JS_FreeValue(ctx, bytecodeObj);
+            if (hasOldEnv > 0) {
+                JS_SetProperty(ctx, global, envAtom, oldEnv);
+            } else {
+                JS_FreeValue(ctx, oldEnv);
+                JS_DeleteProperty(ctx, global, envAtom, 0);
+            }
+            JS_FreeAtom(ctx, envAtom);
+            JS_FreeValue(ctx, global);
+            return GAnyToQJS::makeJsValueToGAny(jsState, JS_EXCEPTION);
+        }
+
+        JSValue r = JS_EvalFunction(ctx, bytecodeObj);
+        r = js_std_await(ctx, r);
+
+        GAny result = GAnyToQJS::makeJsValueToGAny(jsState, r);
+
+        JS_FreeValue(ctx, r);
+        if (hasOldEnv > 0) {
+            JS_SetProperty(ctx, global, envAtom, oldEnv);
+        } else {
+            JS_FreeValue(ctx, oldEnv);
+            JS_DeleteProperty(ctx, global, envAtom, 0);
+        }
+        JS_FreeAtom(ctx, envAtom);
+        JS_FreeValue(ctx, global);
+
+        js_std_loop(ctx);
+
+        return result;
+    }
+
+    const JSValue funcObj = JS_EvalFunction(ctx, bytecodeObj);
     if (JS_IsException(funcObj)) {
         GAny e = GAnyToQJS::makeJsValueToGAny(jsState, funcObj);
         JS_FreeValue(ctx, funcObj);
@@ -2456,21 +2529,21 @@ GAny GAnyJSImplQjs::evalByteCode(const GByteArray &bytes, const GAny &env)
         envObj = GAny::object();
     }
 
-    const JSValue global = JS_GetGlobalObject(mJSContext);
+    const JSValue global = JS_GetGlobalObject(ctx);
 
     JSValue argv[] = {
-        GAnyToQJS::makeGAnyToJsValue(jsState, envObj, false)
+        GAnyToQJS::makeGAnyToJsValue(jsState, envObj, true)
     };
-    const JSValue r = JS_Call(mJSContext, funcObj, global, 1, argv);
+    const JSValue r = JS_Call(ctx, funcObj, global, 1, argv);
 
     GAny result = GAnyToQJS::makeJsValueToGAny(jsState, r);
 
-    JS_FreeValue(mJSContext, r);
-    JS_FreeValue(mJSContext, global);
-    JS_FreeValue(mJSContext, funcObj);
-    JS_FreeValue(mJSContext, argv[0]);
+    JS_FreeValue(ctx, r);
+    JS_FreeValue(ctx, global);
+    JS_FreeValue(ctx, funcObj);
+    JS_FreeValue(ctx, argv[0]);
 
-    js_std_loop(mJSContext);
+    js_std_loop(ctx);
 
     return result;
 }
@@ -2499,28 +2572,44 @@ GAny GAnyJSImplQjs::compile(const std::string &script, const std::string &source
     CHECK_CONDITION_R(mJSContext != nullptr, GAnyException("JS runtime not initialized"));
 
     JSContext *ctx = mJSContext;
-    const JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
 
-    const JSValue funcObj = JS_Eval(ctx, script.c_str(), script.size(), sourcePath.c_str(),
-                                    JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    const bool isModule = shouldEvalAsJsModule(script, sourcePath);
+    const int evalFlags = (isModule ? JS_EVAL_TYPE_MODULE : JS_EVAL_TYPE_GLOBAL)
+                          | JS_EVAL_FLAG_COMPILE_ONLY;
+
+    const JSValue funcObj = JS_Eval(ctx, script.c_str(), script.size(),
+                                    sourcePath.empty() ? "<input>" : sourcePath.c_str(), evalFlags);
 
     if (JS_IsException(funcObj)) {
+        const JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
         GAny exception = GAnyToQJS::makeJsValueToGAny(jsState, funcObj);
         JS_FreeValue(ctx, funcObj);
         return exception;
     }
 
+    if (isModule) {
+        if (js_module_set_import_meta(ctx, funcObj, false, false) < 0) {
+            JS_FreeValue(ctx, funcObj);
+            const JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
+            return GAnyToQJS::makeJsValueToGAny(jsState, JS_EXCEPTION);
+        }
+    }
+
     size_t bytecodeLen;
     uint8_t *bytecodeBuf = JS_WriteObject(ctx, &bytecodeLen, funcObj, JS_WRITE_OBJ_BYTECODE);
 
+    JS_FreeValue(ctx, funcObj);
+
     if (!bytecodeBuf) {
-        JS_FreeValue(ctx, funcObj);
         return GAnyException("Failed to write bytecode");
     }
 
-    GByteArray result(bytecodeBuf, bytecodeLen);
+    GByteArray result(GxBytecodeHeaderSize + bytecodeLen);
+    result.write(GxBytecodeHeaderMagic, 4);
+    const uint8_t flags = isModule ? GxBytecodeFlagModule : 0;
+    result.write(flags);
+    result.write(bytecodeBuf, bytecodeLen);
 
-    JS_FreeValue(ctx, funcObj);
     js_free(ctx, bytecodeBuf);
 
     return result;
