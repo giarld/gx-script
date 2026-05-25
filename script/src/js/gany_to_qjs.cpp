@@ -210,6 +210,7 @@ bool GAnyToQJS::toJS(JS_State *jsState, bool isWorker)
 
     JS_SetPropertyStr(jsState->ctx, cppObj, "create", JS_NewCFunction(jsState->ctx, JS_GAnyCreate, "create", 1));
     JS_SetPropertyStr(jsState->ctx, cppObj, "createWorkerCallable", JS_NewCFunction(jsState->ctx, JS_GAnyCreateWorkerCallable, "createWorkerCallable", 1));
+    JS_SetPropertyStr(jsState->ctx, cppObj, "compileWorkerScript", JS_NewCFunction(jsState->ctx, JS_GAnyCompileWorkerScript, "compileWorkerScript", 2));
     JS_SetPropertyStr(jsState->ctx, cppObj, "import", JS_NewCFunction(jsState->ctx, JS_GAnyImport, "import", 2));
     JS_SetPropertyStr(jsState->ctx, cppObj, "parseJson", JS_NewCFunction(jsState->ctx, JS_GAnyParseJson, "parseJson", 1));
     JS_SetPropertyStr(jsState->ctx, cppObj, "class", JS_NewCFunction(jsState->ctx, JS_GAnyClass, "class", 0));
@@ -696,53 +697,66 @@ JSValue GAnyToQJS::JS_GAnyCreate(JSContext *ctx, JSValue /*thisVal*/, int argc, 
 
 JSValue GAnyToQJS::JS_GAnyCreateWorkerCallable(JSContext *ctx, JSValue /*thisVal*/, int argc, JSValue *argv)
 {
-    if (argc != 1 && argc != 2) {
+    if (argc < 1 || argc > 3) {
         JS_ThrowInternalError(ctx, "Wrong number of argc");
-        return JS_EXCEPTION;
-    }
-
-    const JSValue argv0 = argv[0];
-    if (!JS_IsString(argv0)) {
-        JS_ThrowInternalError(ctx, "Wrong argument type, must be a string");
         return JS_EXCEPTION;
     }
 
     const JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
 
-    const char *str = JS_ToCString(ctx, argv0);
-    const std::string input(str);
-    JS_FreeCString(ctx, str);
+    const GAny arg0GAny = makeJsValueToGAny(jsState, argv[0]);
+    const bool isBytecode = arg0GAny.is<GByteArray>();
 
-    GAny env;
-    if (argc == 2) {
-        const JSValue argv1 = argv[1];
+    GByteArray bytecodeData;
+    std::string input;
+    std::string basenameStr;
 
-        env = makeJsValueToGAny(jsState, argv1);
+    if (isBytecode) {
+        bytecodeData = *arg0GAny.as<GByteArray>();
+    } else {
+        const char *str = JS_ToCString(ctx, argv[0]);
+        if (!str) {
+            JS_ThrowTypeError(ctx, "First argument must be a string or bytecode");
+            return JS_EXCEPTION;
+        }
+        input = str;
+        JS_FreeCString(ctx, str);
+
+        const JSAtom basenameAtom = JS_GetScriptOrModuleName(ctx, 1);
+        if (basenameAtom == JS_ATOM_NULL) {
+            JS_ThrowTypeError(ctx, "could not determine calling script or module name");
+            return JS_EXCEPTION;
+        }
+        const char *basename = JS_AtomToCString(ctx, basenameAtom);
+        basenameStr = basename;
+        JS_FreeCString(ctx, basename);
+        JS_FreeAtom(ctx, basenameAtom);
     }
 
+    GAny env;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        env = makeJsValueToGAny(jsState, argv[1]);
+    }
     if (!env.isObject()) {
         env = GAny::object();
     }
 
-    const JSAtom basenameAtom = JS_GetScriptOrModuleName(ctx, 1);
-    if (basenameAtom == JS_ATOM_NULL) {
-        JS_ThrowTypeError(ctx, "could not determine calling script or module name");
-        return JS_EXCEPTION;
+    GAny options;
+    if (argc >= 3 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
+        options = makeJsValueToGAny(jsState, argv[2]);
     }
-    const char *basename = JS_AtomToCString(ctx, basenameAtom);
-
-    const std::string basenameStr = basename;
-
-    JS_FreeCString(ctx, basename);
-    JS_FreeAtom(ctx, basenameAtom);
 
     const GAnyFunction threadFunc = GAnyFunction::createVariadicFunction(
         "JSWorkerCallable",
-        [input, basenameStr, env](const GAny **, int32_t)-> GAny {
+        [input, basenameStr, bytecodeData, env, isBytecode, options](const GAny **, int32_t)-> GAny {
             const auto js = GAnyJS::threadLocal();
             CHECK_CONDITION_S_R(js != nullptr,
                                 GAnyException("Unable to obtain the JS instance of the current thread"),
                                 "Unable to obtain the JS instance of the current thread");
+
+            if (isBytecode) {
+                return js->evalByteCode(bytecodeData, env);
+            }
 
             if (!input.empty() && input[0] == '.') {
                 const std::string modulePath = GAnyJSImplQjs::sModuleNormalizeFunc(basenameStr, input);
@@ -752,6 +766,69 @@ JSValue GAnyToQJS::JS_GAnyCreateWorkerCallable(JSContext *ctx, JSValue /*thisVal
         });
 
     return makeGAnyToJsValue(jsState, threadFunc, false);
+}
+
+JSValue GAnyToQJS::JS_GAnyCompileWorkerScript(JSContext *ctx, JSValue /*thisVal*/, int argc, JSValue *argv)
+{
+    if (argc < 1 || argc > 2) {
+        JS_ThrowInternalError(ctx, "Wrong number of argc");
+        return JS_EXCEPTION;
+    }
+
+    const JS_State *jsState = static_cast<JS_State *>(JS_GetContextOpaque(ctx));
+
+    const char *input = JS_ToCString(ctx, argv[0]);
+    if (!input) {
+        JS_ThrowTypeError(ctx, "Argument must be a string");
+        return JS_EXCEPTION;
+    }
+    const std::string scriptStr(input);
+    JS_FreeCString(ctx, input);
+
+    std::string sourcePath;
+    if (argc >= 2) {
+        const char *sp = JS_ToCString(ctx, argv[1]);
+        if (sp) {
+            sourcePath = sp;
+            JS_FreeCString(ctx, sp);
+        }
+    }
+
+    std::string compileScript;
+    std::string compileSourcePath;
+
+    if (!scriptStr.empty() && scriptStr[0] == '.') {
+        const JSAtom basenameAtom = JS_GetScriptOrModuleName(ctx, 1);
+        if (basenameAtom == JS_ATOM_NULL) {
+            JS_ThrowTypeError(ctx, "could not determine calling script or module name");
+            return JS_EXCEPTION;
+        }
+        const char *basename = JS_AtomToCString(ctx, basenameAtom);
+        const std::string basenameStr(basename);
+        JS_FreeCString(ctx, basename);
+        JS_FreeAtom(ctx, basenameAtom);
+
+        const std::string modulePath = GAnyJSImplQjs::sModuleNormalizeFunc(basenameStr, scriptStr);
+        const GByteArray fileBytes = GAnyJSImplQjs::sFileReader(modulePath);
+        if (fileBytes.isEmpty()) {
+            JS_ThrowTypeError(ctx, "Failed to read file: %s", scriptStr.c_str());
+            return JS_EXCEPTION;
+        }
+        compileScript = std::string(reinterpret_cast<const char *>(fileBytes.data()), fileBytes.size());
+        compileSourcePath = modulePath;
+    } else {
+        compileScript = scriptStr;
+        compileSourcePath = sourcePath;
+    }
+
+    const auto js = GAnyJS::threadLocal();
+    CHECK_CONDITION_S_R(js != nullptr,
+                        JS_ThrowInternalError(ctx, "Unable to obtain JS instance"),
+                        "Unable to obtain JS instance");
+
+    const GAny result = js->compile(compileScript, compileSourcePath);
+
+    return makeGAnyToJsValue(jsState, result, false);
 }
 
 JSValue GAnyToQJS::JS_GAnyImport(JSContext *ctx, JSValue /*thisVal*/, int argc, JSValue *argv)

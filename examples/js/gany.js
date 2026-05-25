@@ -4,7 +4,7 @@
  * 这个文件为通过 gany_to_js.cpp 暴露给 QuickJS 的 GAny API 提供 JSDoc 定义。
  * 它旨在帮助 IDE 提供代码自动补全和类型提示。
  * 注意：由于 GAny 的动态性，此文件可能无法包含所有通过 C++ 注册的类和方法。
- * @version 1.4.2
+ * @version 1.4.3
  */
 
 // ======================================================================
@@ -528,12 +528,47 @@ const GAny = {
     create: function(value) {},
 
     /**
-     * 创建一个多线程可调用的调用器函数
-     * @param {string} input - 输入, 脚本代码或脚本文件路径
-     * @param {GAnyUserObject|object} env - 环境变量对象, 可选
-     * @returns {GAnyUserObject} 新创建的 GAny 函数对象, 可使用 _call 调用，或传递给线程。
+     * 创建一个多线程可调用的调用器函数。
+     * 
+     * 如果 `input` 是字符串（路径或脚本代码），每次调用都会在 worker 线程重新编译脚本。
+     * 如果 `input` 是 compileWorkerScript 返回的字节码，会在 worker 线程直接加载执行，避免重复编译。
+     *
+     * @param {string|GAnyUserObject} input - 脚本代码、脚本文件路径（以 `./` 开头），或 compileWorkerScript 的字节码结果。
+     * @param {GAnyUserObject|object} [env] - 环境变量对象，会作为脚本 IIFE 的 Env 参数传入。
+     * @param {object} [options] - 可选参数（预留扩展）。
+     * @returns {GAnyUserObject} 新创建的 GAny 函数对象，可使用 _call 调用，或传递给线程。
      */
-    createWorkerCallable: function(input, env = {}) {},
+    createWorkerCallable: function(input, env = {}, options = undefined) {},
+
+    /**
+     * 预编译一个 worker 脚本为字节码，供 createWorkerCallable 重复使用。
+     *
+     * - 如果 `input` 以 `./` 开头，会解析为相对于调用者的文件路径并读取文件内容。
+     * - 否则，`input` 视为 inline JS 源码，`sourcePath` 参数可用于指定错误栈中的文件名。
+     *
+     * 返回的字节码对象可多次传入 createWorkerCallable，每次提交到 worker 线程时直接加载执行，
+     * 无需重新从文件读取和编译。
+     *
+     * @param {string} input - 脚本文件路径（以 `./` 开头）或 inline JS 源码。
+     * @param {string} [sourcePath] - 当 input 为 inline 源码时，指定错误栈中的源文件名。
+     * @returns {GAnyUserObject} 编译后的字节码对象（GByteArray），可传递给 createWorkerCallable。
+     *
+     * @example
+     * // 从文件编译
+     * let bc = GAny.compileWorkerScript("./my_task.js");
+     * let cc = GAny.createWorkerCallable(bc, { x: 1, y: 2 });
+     * // 多次提交无需重新编译
+     * let task1 = ts.submit(cc);
+     * let task2 = ts.submit(cc);
+     *
+     * @example
+     * // 从 inline 源码编译
+     * let bc = GAny.compileWorkerScript(
+     *     "(function(Env) { return Env.a + Env.b; })",
+     *     "<inline>"
+     * );
+     */
+    compileWorkerScript: function(input, sourcePath = undefined) {},
 
     /**
      * 从 C++ 注册表中导入一个 GAny 类或命名空间对象。

@@ -39,6 +39,8 @@ private:
 
     static JSValue JS_GAnyCreateWorkerCallable(JSContext *ctx, JSValue thisVal, int argc, JSValue *argv);
 
+    static JSValue JS_GAnyCompileWorkerScript(JSContext *ctx, JSValue thisVal, int argc, JSValue *argv);
+
     static JSValue JS_GAnyImport(JSContext *ctx, JSValue thisVal, int argc, JSValue *argv);
 
     static JSValue JS_GAnyParseJson(JSContext *ctx, JSValue thisVal, int argc, JSValue *argv);
