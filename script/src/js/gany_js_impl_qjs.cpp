@@ -2244,6 +2244,8 @@ GAnyJS::ExceptionHandler GAnyJSImplQjs::sExceptionHandler = sDefExceptionHandler
 
 std::shared_ptr<GAnyJS> GAnyJS::threadLocal()
 {
+    CHECK_CONDITION_S_R(pfnGanyGetEnv != nullptr, nullptr, "GxScript module not loaded!");
+
     thread_local auto vm = std::make_shared<GAnyJSImplQjs>();
     return vm;
 }

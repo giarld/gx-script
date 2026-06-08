@@ -822,6 +822,8 @@ GAny GAnyLuaImpl::getGAnyClassDB()
 
 std::shared_ptr<GAnyLua> GAnyLua::threadLocal()
 {
+    CHECK_CONDITION_S_R(pfnGanyGetEnv != nullptr, nullptr, "GxScript module not loaded!");
+
     thread_local auto vm = std::make_shared<GAnyLuaImpl>();
     return vm;
 }
