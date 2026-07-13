@@ -801,12 +801,13 @@ GByteArray GAnyLuaImpl::compile(const GByteArray &buffer, const std::string &sou
 
 GAny GAnyLuaImpl::getGAnyClassDB()
 {
-    if (!pfnGanyGetEnv) {
+    const auto getEnv = getPfnGanyGetEnv();
+    if (!getEnv) {
         return GAny();
     }
 
     GAny envObj;
-    pfnGanyGetEnv(&envObj);
+    getEnv(&envObj);
     if (!envObj.isObject()) {
         return GAny();
     }
@@ -822,7 +823,7 @@ GAny GAnyLuaImpl::getGAnyClassDB()
 
 std::shared_ptr<GAnyLua> GAnyLua::threadLocal()
 {
-    CHECK_CONDITION_S_R(pfnGanyGetEnv != nullptr, nullptr, "GxScript module not loaded!");
+    CHECK_CONDITION_S_R(getPfnGanyGetEnv() != nullptr, nullptr, "GAny core not initialized!");
 
     thread_local auto vm = std::make_shared<GAnyLuaImpl>();
     return vm;

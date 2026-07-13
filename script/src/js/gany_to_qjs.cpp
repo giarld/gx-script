@@ -1776,12 +1776,13 @@ int GAnyToQJS::JS_GAnyDefineOwnProperty(JSContext *ctx, JSValueConst thisObj, JS
 
 GAny GAnyToQJS::getGAnyClassDB()
 {
-    if (!pfnGanyGetEnv) {
+    const auto getEnv = getPfnGanyGetEnv();
+    if (!getEnv) {
         return GAny();
     }
 
     GAny envObj;
-    pfnGanyGetEnv(&envObj);
+    getEnv(&envObj);
     if (!envObj.isObject()) {
         return GAny();
     }
